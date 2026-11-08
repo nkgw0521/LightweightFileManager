@@ -1,0 +1,12 @@
+/build/
+/build-*/
+/target/
+**/target/
+.vs/
+CMakeFiles/
+CMakeCache.txt
+*.obj
+*.pdb
+*.lib
+*.exp
+*.ilk
