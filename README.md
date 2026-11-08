@@ -125,3 +125,7 @@ Qtのインストール場所をCMakeが認識できる状態で、次のよう�
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
+
+## Windows配布版
+
+`release/LightweightFileManager-windows-x64.zip` をダウンロードして展開してください。QtのDLLとプラグイン、およびMicrosoft Visual C++ランタイムの公式インストーラーを同梱しています。フォルダー内の `lightweight-file-manager.exe` を起動し、ランタイム不足が表示された場合は `vc_redist.x64.exe` を実行してください。DLLやサブフォルダーはexeと同じ配布フォルダーに置いたまま使用してください。
