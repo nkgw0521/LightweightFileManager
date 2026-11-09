@@ -37,9 +37,11 @@ qt_add_executable(lightweight-file-manager
     src/main.cpp
 )
 if(WIN32)
+    set(LIGHTWEIGHT_FILE_MANAGER_OUTPUT_DIR "${CMAKE_BINARY_DIR}/app" CACHE PATH "Application output directory")
+    target_sources(lightweight-file-manager PRIVATE src/app.rc)
     set_target_properties(lightweight-file-manager PROPERTIES
         WIN32_EXECUTABLE ON
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/app")
+        RUNTIME_OUTPUT_DIRECTORY "${LIGHTWEIGHT_FILE_MANAGER_OUTPUT_DIR}")
 endif()
 add_dependencies(lightweight-file-manager fm_core_build)
 target_include_directories(lightweight-file-manager PRIVATE "${RUST_TARGET_DIR}/cxxbridge")

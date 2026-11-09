@@ -2,6 +2,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
+#include <QFileIconProvider>
 #include <QFileDialog>
 #include <QFile>
 #include <QHeaderView>
@@ -47,11 +48,16 @@
 #include <QStandardPaths>
 #include <QIcon>
 #include <QColor>
+#include <QtEndian>
 #include <QPen>
 #include <QRectF>
 #include <QFont>
 #include <QSizePolicy>
 #include <QEvent>
+#include <QDrag>
+#include <QMouseEvent>
+#include <QDragEnterEvent>
+#include <QDropEvent>
 #include <QScrollArea>
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrentRun>
@@ -66,11 +72,76 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <shlobj.h>
+#include <shobjidl.h>
 #endif
 
 namespace {
 QString rustString(const rust::String& value) {
     return QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size()));
+}
+
+QString resolvePathInput(QString input) {
+    input = input.trimmed();
+#if defined(Q_OS_WIN)
+    if (input.startsWith(QStringLiteral("shell:"), Qt::CaseInsensitive)) {
+        const auto alias = input.mid(6).trimmed().toLower();
+        const KNOWNFOLDERID* folder = nullptr;
+        if (alias == "sendto") folder = &FOLDERID_SendTo;
+        else if (alias == "desktop" || alias == "desktopfolder") folder = &FOLDERID_Desktop;
+        else if (alias == "personal" || alias == "my documents") folder = &FOLDERID_Documents;
+        else if (alias == "downloads") folder = &FOLDERID_Downloads;
+        else if (alias == "startup") folder = &FOLDERID_Startup;
+        else if (alias == "programs") folder = &FOLDERID_Programs;
+        else if (alias == "appdata") folder = &FOLDERID_RoamingAppData;
+        if (folder) {
+            PWSTR resolved = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(*folder, 0, nullptr, &resolved)) && resolved) {
+                const auto result = QString::fromWCharArray(resolved);
+                CoTaskMemFree(resolved);
+                return result;
+            }
+        }
+    }
+    const auto wideInput = input.toStdWString();
+    const auto required = ExpandEnvironmentStringsW(wideInput.c_str(), nullptr, 0);
+    if (required > 1) {
+        std::wstring expanded(static_cast<size_t>(required), L'\0');
+        const auto written = ExpandEnvironmentStringsW(wideInput.c_str(), expanded.data(), required);
+        if (written > 0 && written <= required) {
+            expanded.resize(written - 1);
+            return QString::fromStdWString(expanded);
+        }
+    }
+#endif
+    return input;
+}
+
+QString shortcutTargetPath(const QString& shortcutPath) {
+#if defined(Q_OS_WIN)
+    const auto initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const auto shouldUninitialize = SUCCEEDED(initialized);
+    IShellLinkW* shellLink = nullptr;
+    QString target;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_IShellLinkW, reinterpret_cast<void**>(&shellLink)))) {
+        IPersistFile* persistFile = nullptr;
+        if (SUCCEEDED(shellLink->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(&persistFile)))) {
+            if (SUCCEEDED(persistFile->Load(reinterpret_cast<LPCOLESTR>(shortcutPath.utf16()), STGM_READ))) {
+                wchar_t path[MAX_PATH]{};
+                if (SUCCEEDED(shellLink->GetPath(path, MAX_PATH, nullptr, SLGP_RAWPATH)))
+                    target = QString::fromWCharArray(path);
+            }
+            persistFile->Release();
+        }
+        shellLink->Release();
+    }
+    if (shouldUninitialize) CoUninitialize();
+    return target;
+#else
+    Q_UNUSED(shortcutPath);
+    return {};
+#endif
 }
 
 QString coreCreateDirectory(const QString& path) {
@@ -264,7 +335,7 @@ QIcon splitIndicatorIcon(int paneCount) {
 
 class FilePane final : public QWidget {
 public:
-    FilePane(const QString& startPath, const QStringList& savedPaths, int selectedTab,
+    FilePane(const QString& startPath, const QStringList& savedPaths, const QStringList& savedLockedPaths, int selectedTab,
              std::function<void()> onChanged, QWidget* parent = nullptr)
         : QWidget(parent), m_path(startPath), m_onChanged(std::move(onChanged)) {
         setObjectName("filePane");
@@ -275,6 +346,7 @@ public:
         m_tabs->setExpanding(false);
         m_tabs->setTabsClosable(true);
         m_tabs->setMovable(true);
+        m_tabs->setContextMenuPolicy(Qt::CustomContextMenu);
         auto* tabRow = new QHBoxLayout;
         tabRow->setContentsMargins(8, 4, 8, 4);
         tabRow->setSpacing(6);
@@ -289,13 +361,13 @@ public:
         auto* pathBar = new QLineEdit(this);
         m_pathBar = pathBar;
         pathBar->installEventFilter(this);
-        pathBar->setText(m_path);
+        pathBar->setText(QDir::toNativeSeparators(m_path));
         pathBar->setClearButtonEnabled(true);
         pathBar->setPlaceholderText(tr("フォルダーのパス"));
         layout->addWidget(pathBar);
 
-        m_table = new QTableWidget(0, 3, this);
-        m_table->setHorizontalHeaderLabels({tr("名前"), tr("更新日時"), tr("サイズ")});
+        m_table = new QTableWidget(0, 4, this);
+        m_table->setHorizontalHeaderLabels({tr("名前"), tr("拡張子"), tr("更新日時"), tr("サイズ")});
         m_table->setSelectionBehavior(QAbstractItemView::SelectRows);
         m_table->setSelectionMode(QAbstractItemView::ExtendedSelection);
         m_table->setAlternatingRowColors(true);
@@ -306,8 +378,14 @@ public:
         m_table->installEventFilter(this);
         m_table->viewport()->installEventFilter(this);
         m_table->verticalHeader()->hide();
-        m_table->horizontalHeader()->setStretchLastSection(true);
-        m_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+        m_table->setSortingEnabled(true);
+        m_table->horizontalHeader()->setSectionsClickable(true);
+        m_table->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+        m_table->horizontalHeader()->resizeSection(0, 360);
+        m_table->horizontalHeader()->resizeSection(1, 90);
+        m_table->horizontalHeader()->resizeSection(2, 150);
+        m_table->horizontalHeader()->resizeSection(3, 100);
+        m_table->sortItems(0, Qt::AscendingOrder);
         layout->addWidget(m_table, 1);
         m_tabs->installEventFilter(this);
         addTabButton->installEventFilter(this);
@@ -321,17 +399,30 @@ public:
             notifyChanged();
         });
         connect(m_tabs, &QTabBar::tabCloseRequested, this, [this](int index) {
+            if (isTabLocked(index)) return;
             if (m_tabs->count() > 1) {
                 m_tabs->removeTab(index);
                 if (m_tabs->count() > 0) m_tabs->setCurrentIndex(qMin(index, m_tabs->count() - 1));
                 notifyChanged();
             }
         });
+        connect(m_tabs, &QTabBar::customContextMenuRequested, this, [this](const QPoint& position) {
+            const auto index = m_tabs->tabAt(position);
+            if (index < 0) return;
+            QMenu menu(m_tabs);
+            auto* toggleLock = menu.addAction(isTabLocked(index) ? tr("タブのロックを解除") : tr("タブをロック"));
+            if (menu.exec(m_tabs->mapToGlobal(position)) != toggleLock) return;
+            const auto path = m_tabs->tabData(index).toString();
+            if (isTabLocked(index)) m_lockedPaths.remove(path);
+            else m_lockedPaths.insert(path);
+            updateTabLabel(index);
+            notifyChanged();
+        });
         connect(m_tabs, &QTabBar::currentChanged, this, [this](int index) {
             const auto destination = m_tabs->tabData(index).toString();
             if (!destination.isEmpty()) {
                 m_path = destination;
-                m_pathBar->setText(m_path);
+                m_pathBar->setText(QDir::toNativeSeparators(m_path));
                 refresh();
                 recordHistory(m_path);
                 activate();
@@ -344,8 +435,12 @@ public:
             if (!item) return;
             const auto destination = item->data(Qt::UserRole).toString();
             if (item->data(Qt::UserRole + 1).toBool() && QFileInfo(destination).isDir()) setPath(destination);
-            else QDesktopServices::openUrl(QUrl::fromLocalFile(destination));
-            pathBar->setText(m_path);
+            else if (QFileInfo(destination).suffix().compare(QStringLiteral("lnk"), Qt::CaseInsensitive) == 0) {
+                const auto target = shortcutTargetPath(destination);
+                if (QFileInfo(target).isDir()) setPath(target);
+                else QDesktopServices::openUrl(QUrl::fromLocalFile(destination));
+            } else QDesktopServices::openUrl(QUrl::fromLocalFile(destination));
+            pathBar->setText(QDir::toNativeSeparators(m_path));
         });
         connect(m_table, &QWidget::customContextMenuRequested, this, [this](const QPoint& position) {
             showContextMenu(position);
@@ -367,6 +462,8 @@ public:
             }
             if (m_tabs->count() == 0) addLocationTab(startPath);
             m_tabs->setCurrentIndex(qBound(0, selectedTab, m_tabs->count() - 1));
+            for (const auto& lockedPath : savedLockedPaths) m_lockedPaths.insert(QDir::cleanPath(lockedPath));
+            for (int i = 0; i < m_tabs->count(); ++i) updateTabLabel(i);
         }
         m_path = m_tabs->tabData(m_tabs->currentIndex()).toString();
         m_pathBar->setText(m_path);
@@ -380,6 +477,7 @@ public:
         for (int i = 0; i < m_tabs->count(); ++i) paths.append(m_tabs->tabData(i).toString());
         return paths;
     }
+    QStringList lockedLocationPaths() const { return m_lockedPaths.values(); }
 
     int selectedTab() const { return m_tabs->currentIndex(); }
     QString currentPath() const { return m_path; }
@@ -456,6 +554,7 @@ private:
     QTabBar* m_tabs = nullptr;
     QLineEdit* m_pathBar = nullptr;
     QTableWidget* m_table = nullptr;
+    QFileIconProvider m_iconProvider;
     quint64 m_requestId = 0;
     std::function<void()> m_onChanged;
     std::function<void(FilePane*)> m_onActivated;
@@ -463,6 +562,16 @@ private:
     QStringList m_history;
     int m_historyIndex = -1;
     bool m_replayingHistory = false;
+    QSet<QString> m_lockedPaths;
+
+    bool isTabLocked(int index) const {
+        return index >= 0 && m_lockedPaths.contains(m_tabs->tabData(index).toString());
+    }
+
+    void updateTabLabel(int index) {
+        const auto path = m_tabs->tabData(index).toString();
+        m_tabs->setTabText(index, (isTabLocked(index) ? QStringLiteral("🔒 ") : QString{}) + folderLabel(path));
+    }
 
     static QString folderLabel(const QString& path) {
         const auto name = QFileInfo(path).fileName();
@@ -470,8 +579,9 @@ private:
     }
 
     void addLocationTab(const QString& path) {
-        const auto index = m_tabs->addTab(folderLabel(path));
-        m_tabs->setTabData(index, QDir::cleanPath(path));
+        const auto clean = QDir::cleanPath(path);
+        const auto index = m_tabs->addTab(folderLabel(clean));
+        m_tabs->setTabData(index, clean);
         m_tabs->setCurrentIndex(index);
     }
 
@@ -501,10 +611,20 @@ private:
     }
 
     void setPath(const QString& path) {
-        const auto clean = QDir::cleanPath(path);
+        const auto resolvedPath = resolvePathInput(path);
+        const auto clean = QDir::cleanPath(resolvedPath);
         if (!QFileInfo(clean).isDir()) return;
         const auto current = m_tabs->currentIndex();
         if (current >= 0 && m_tabs->tabData(current).toString() == clean) return;
+        if (current >= 0 && isTabLocked(current)) {
+            addLocationTab(clean);
+            m_path = clean;
+            m_pathBar->setText(QDir::toNativeSeparators(m_path));
+            recordHistory(m_path);
+            refresh();
+            notifyChanged();
+            return;
+        }
         for (int i = 0; i < m_tabs->count(); ++i) {
             if (i == current) continue;
             if (m_tabs->tabData(i).toString() == clean) {
@@ -516,7 +636,7 @@ private:
             m_tabs->setTabData(current, clean);
             m_tabs->setTabText(current, folderLabel(clean));
             m_path = clean;
-            m_pathBar->setText(m_path);
+            m_pathBar->setText(QDir::toNativeSeparators(m_path));
             recordHistory(m_path);
             refresh();
         }
@@ -539,7 +659,26 @@ private:
 
     void populate(const QString& json) {
         const auto document = QJsonDocument::fromJson(json.toUtf8());
-        const auto entries = document.array();
+        auto entries = document.array();
+        const auto parentPath = QFileInfo(m_path).absolutePath();
+        if (parentPath != m_path) {
+            QJsonObject parentEntry;
+            parentEntry.insert("name", "..");
+            parentEntry.insert("path", parentPath);
+            parentEntry.insert("is_dir", true);
+            parentEntry.insert("size", 0);
+            parentEntry.insert("modified", 0);
+            entries.prepend(parentEntry);
+        }
+        QJsonObject currentEntry;
+        currentEntry.insert("name", ".");
+        currentEntry.insert("path", m_path);
+        currentEntry.insert("is_dir", true);
+        currentEntry.insert("size", 0);
+        currentEntry.insert("modified", 0);
+        entries.prepend(currentEntry);
+        const auto sorting = m_table->isSortingEnabled();
+        m_table->setSortingEnabled(false);
         m_table->setRowCount(entries.size());
         for (qsizetype row = 0; row < entries.size(); ++row) {
             const auto entry = entries.at(row).toObject();
@@ -547,17 +686,21 @@ private:
             const auto path = entry.value("path").toString();
             const auto isDir = entry.value("is_dir").toBool();
             auto* nameItem = new QTableWidgetItem(name);
-            nameItem->setIcon(fileItemIcon(isDir));
+            nameItem->setIcon(m_iconProvider.icon(QFileInfo(path)));
             nameItem->setData(Qt::UserRole, path);
             nameItem->setData(Qt::UserRole + 1, isDir);
+            auto* extensionItem = new QTableWidgetItem(isDir ? QString{} : QFileInfo(name).suffix());
             auto* timeItem = new QTableWidgetItem(QDateTime::fromSecsSinceEpoch(entry.value("modified").toInteger()).toString("yyyy/MM/dd HH:mm"));
             const auto size = entry.value("size").toInteger();
             auto* sizeItem = new QTableWidgetItem(isDir ? QString{} : QLocale().formattedDataSize(size));
             sizeItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
             m_table->setItem(static_cast<int>(row), 0, nameItem);
-            m_table->setItem(static_cast<int>(row), 1, timeItem);
-            m_table->setItem(static_cast<int>(row), 2, sizeItem);
+            m_table->setItem(static_cast<int>(row), 1, extensionItem);
+            m_table->setItem(static_cast<int>(row), 2, timeItem);
+            m_table->setItem(static_cast<int>(row), 3, sizeItem);
         }
+        m_table->setSortingEnabled(sorting);
+        m_table->sortItems(m_table->horizontalHeader()->sortIndicatorSection(), m_table->horizontalHeader()->sortIndicatorOrder());
     }
 
     void addShortcut(const QKeySequence& sequence, std::function<void()> action) {
@@ -594,6 +737,10 @@ private:
         QMenu menu(m_table);
         auto* open = menu.addAction(tr("開く"));
         open->setEnabled(paths.size() == 1);
+        auto* openInNewTab = menu.addAction(tr("新しいタブで開く"));
+        openInNewTab->setEnabled(paths.size() == 1 && QFileInfo(paths.first()).isDir());
+        auto* copyPath = menu.addAction(tr("パスのコピー"));
+        copyPath->setEnabled(paths.size() == 1);
         auto* terminal = menu.addAction(terminalActionText());
         QString terminalDirectory = m_path;
         if (paths.size() == 1 && QFileInfo(paths.first()).isDir()) terminalDirectory = paths.first();
@@ -618,6 +765,8 @@ private:
 
         auto* chosen = menu.exec(m_table->viewport()->mapToGlobal(position));
         if (chosen == open) openSelection();
+        else if (chosen == openInNewTab && paths.size() == 1) { addLocationTab(paths.first()); notifyChanged(); }
+        else if (chosen == copyPath && paths.size() == 1) QApplication::clipboard()->setText(QDir::toNativeSeparators(paths.first()));
         else if (chosen == terminal && !openTerminalAt(terminalDirectory)) {
             QMessageBox::warning(this, tr("端末を開けません"), tr("この環境でターミナルを起動できませんでした。"));
         }
@@ -637,7 +786,11 @@ private:
         if (paths.size() != 1) return;
         const auto path = paths.first();
         if (QFileInfo(path).isDir()) setPath(path);
-        else QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+        else if (QFileInfo(path).suffix().compare(QStringLiteral("lnk"), Qt::CaseInsensitive) == 0) {
+            const auto target = shortcutTargetPath(path);
+            if (QFileInfo(target).isDir()) setPath(target);
+            else QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+        } else QDesktopServices::openUrl(QUrl::fromLocalFile(path));
     }
 
     void copySelection(bool cut) {
@@ -648,6 +801,13 @@ private:
         for (const auto& path : paths) urls.append(QUrl::fromLocalFile(path));
         mimeData->setUrls(urls);
         mimeData->setData("application/x-lightweight-file-manager-operation", cut ? "move" : "copy");
+#if defined(Q_OS_WIN)
+        if (cut) {
+            QByteArray effect(sizeof(quint32), Qt::Uninitialized);
+            qToLittleEndian<quint32>(2, reinterpret_cast<uchar*>(effect.data()));
+            mimeData->setData(QStringLiteral("Preferred DropEffect"), effect);
+        }
+#endif
         QApplication::clipboard()->setMimeData(mimeData);
     }
 
@@ -655,7 +815,14 @@ private:
         const auto* mimeData = QApplication::clipboard()->mimeData();
         const auto urls = mimeData->urls();
         if (urls.isEmpty()) return;
-        const auto moving = mimeData->data("application/x-lightweight-file-manager-operation") == "move";
+        auto moving = mimeData->data("application/x-lightweight-file-manager-operation") == "move";
+#if defined(Q_OS_WIN)
+        if (!moving && mimeData->hasFormat(QStringLiteral("Preferred DropEffect"))) {
+            const auto effect = mimeData->data(QStringLiteral("Preferred DropEffect"));
+            if (effect.size() >= static_cast<qsizetype>(sizeof(quint32)))
+                moving = qFromLittleEndian<quint32>(reinterpret_cast<const uchar*>(effect.constData())) == 2;
+        }
+#endif
         QStringList errors;
         QStringList affectedDirectories{m_path};
         for (const auto& url : urls) {
@@ -700,9 +867,16 @@ private:
     void deleteSelection() {
         const auto paths = selectedPaths();
         if (paths.isEmpty()) return;
-        const auto answer = QMessageBox::question(this, tr("削除の確認"),
-            tr("選択した %1 件を完全に削除しますか？").arg(paths.size()),
-            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        QMessageBox confirmation(this);
+        confirmation.setWindowTitle(tr("削除の確認"));
+        confirmation.setText(tr("選択した %1 件を完全に削除しますか？").arg(paths.size()));
+        confirmation.setIcon(QMessageBox::Warning);
+        auto* deleteButton = confirmation.addButton(tr("削除"), QMessageBox::DestructiveRole);
+        auto* cancelButton = confirmation.addButton(tr("キャンセル"), QMessageBox::RejectRole);
+        confirmation.setDefaultButton(qobject_cast<QPushButton*>(cancelButton));
+        confirmation.setEscapeButton(cancelButton);
+        confirmation.exec();
+        const auto answer = confirmation.clickedButton() == deleteButton ? QMessageBox::Yes : QMessageBox::No;
         if (answer != QMessageBox::Yes) return;
         QStringList errors;
         for (const auto& path : paths) {
@@ -712,6 +886,7 @@ private:
         QStringList affectedDirectories;
         for (const auto& path : paths) affectedDirectories.append(QFileInfo(path).absolutePath());
         refreshOpenPanes(affectedDirectories);
+        refresh();
         if (!errors.isEmpty()) QMessageBox::warning(this, tr("削除できません"), errors.join('\n'));
     }
 };
@@ -719,6 +894,7 @@ private:
 class MainWindow final : public QMainWindow {
     struct PaneState {
         QStringList paths;
+        QStringList lockedPaths;
         int currentTab = 0;
     };
 
@@ -931,6 +1107,48 @@ public:
     }
 
 protected:
+    bool eventFilter(QObject* watched, QEvent* event) override {
+        auto* button = qobject_cast<QToolButton*>(watched);
+        if (button && button->property("workspaceTab").toBool()) {
+            if (event->type() == QEvent::MouseButtonPress) {
+                button->setProperty("dragStart", static_cast<QPoint>(static_cast<QMouseEvent*>(event)->position().toPoint()));
+            } else if (event->type() == QEvent::MouseMove) {
+                auto* mouse = static_cast<QMouseEvent*>(event);
+                if ((mouse->buttons() & Qt::LeftButton) &&
+                    (mouse->position().toPoint() - button->property("dragStart").toPoint()).manhattanLength() >= QApplication::startDragDistance()) {
+                    auto* mime = new QMimeData;
+                    mime->setText(QString::number(reinterpret_cast<quintptr>(button), 16));
+                    QDrag drag(button);
+                    drag.setMimeData(mime);
+                    drag.exec(Qt::MoveAction);
+                    return true;
+                }
+            } else if (event->type() == QEvent::DragEnter) {
+                auto* drag = static_cast<QDragEnterEvent*>(event);
+                if (!drag->mimeData()->text().isEmpty()) drag->acceptProposedAction();
+                return true;
+            } else if (event->type() == QEvent::Drop) {
+                auto* drop = static_cast<QDropEvent*>(event);
+                bool ok = false;
+                const auto raw = drop->mimeData()->text().toULongLong(&ok, 16);
+                auto* source = ok ? reinterpret_cast<QToolButton*>(static_cast<quintptr>(raw)) : nullptr;
+                int from = -1, to = -1;
+                for (int i = 0; i < m_workspaces.size(); ++i) {
+                    if (m_workspaces[i].button == source) from = i;
+                    if (m_workspaces[i].button == button) to = i;
+                }
+                if (from >= 0 && to >= 0 && from != to) {
+                    const auto pos = drop->position().toPoint();
+                    if (pos.y() > button->height() / 2) ++to;
+                    reorderWorkspace(from, to);
+                }
+                drop->acceptProposedAction();
+                return true;
+            }
+        }
+        return QMainWindow::eventFilter(watched, event);
+    }
+
     void closeEvent(QCloseEvent* event) override {
         saveSettings();
         QMainWindow::closeEvent(event);
@@ -1003,6 +1221,8 @@ private:
                     const auto value = path.toString();
                     if (!value.isEmpty()) pane.paths.append(value);
                 }
+                for (const auto& path : paneObject.value("lockedPaths").toArray())
+                    if (path.isString()) pane.lockedPaths.append(path.toString());
                 pane.currentTab = paneObject.value("currentTab").toInt(0);
                 panes.append(pane);
             }
@@ -1038,7 +1258,7 @@ private:
         for (const auto& paneState : paneStates) {
             const auto initialPath = !paneState.paths.isEmpty() && QFileInfo(paneState.paths.first()).isDir()
                 ? paneState.paths.first() : QDir::homePath();
-            auto* pane = new FilePane(initialPath, paneState.paths, paneState.currentTab,
+            auto* pane = new FilePane(initialPath, paneState.paths, paneState.lockedPaths, paneState.currentTab,
                                       [this] { if (!m_restoring) saveSettings(); }, workspace.splitter);
             attachPane(pane);
             workspace.splitter->addWidget(pane);
@@ -1057,8 +1277,10 @@ private:
         workspace.button->setFixedHeight(48);
         workspace.button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
         workspace.button->setCheckable(true);
+        workspace.button->setProperty("workspaceTab", true);
+        workspace.button->setAcceptDrops(true);
+        workspace.button->installEventFilter(this);
         workspace.button->setContextMenuPolicy(Qt::CustomContextMenu);
-        workspace.button->setToolTip(name);
         workspace.button->setStyleSheet("QToolButton { color: #aab4c2; background: #171c24; border: 1px solid #303946; border-radius: 6px; padding: 5px 10px; font-size: 11pt; } QToolButton:hover { background: #222a34; } QToolButton:checked { color: #edf2f8; background: #27384c; border-color: #5d82b1; }");
         const auto pageIndex = m_pages->addWidget(workspace.page);
         m_workspaces.append(workspace);
@@ -1082,6 +1304,22 @@ private:
         for (int i = 0; i < m_workspaces.size(); ++i) m_workspaces[i].button->setChecked(i == index);
         updateStatus();
         if (persist && !m_restoring) saveSettings();
+    }
+
+    void reorderWorkspace(int from, int insertionIndex) {
+        if (from < 0 || from >= m_workspaces.size()) return;
+        auto* currentPage = m_pages->currentWidget();
+        auto workspace = m_workspaces.takeAt(from);
+        if (insertionIndex > from) --insertionIndex;
+        insertionIndex = qBound(0, insertionIndex, m_workspaces.size());
+        m_workspaces.insert(insertionIndex, workspace);
+        for (int i = 0; i < m_workspaces.size(); ++i) {
+            m_workspaceTabsLayout->removeWidget(m_workspaces[i].button);
+            m_workspaceTabsLayout->insertWidget(i, m_workspaces[i].button);
+            m_pages->insertWidget(i, m_workspaces[i].page);
+        }
+        if (currentPage) m_pages->setCurrentWidget(currentPage);
+        saveSettings();
     }
 
     void renameWorkspace(int index, const QPoint& position) {
@@ -1111,8 +1349,6 @@ private:
         if (!accepted || name.isEmpty()) return;
         workspace.name = name;
         workspace.button->setText(name);
-        workspace.button->setToolTip(name);
-        workspace.button->setToolTip(name);
         saveSettings();
     }
 
@@ -1152,7 +1388,7 @@ private:
             const auto path = workspace.panes.first()->currentPath();
             PaneState pane;
             pane.paths = {path};
-            auto* second = new FilePane(path, pane.paths, 0, [this] { if (!m_restoring) saveSettings(); }, workspace.splitter);
+            auto* second = new FilePane(path, pane.paths, pane.lockedPaths, 0, [this] { if (!m_restoring) saveSettings(); }, workspace.splitter);
             attachPane(second);
             workspace.splitter->addWidget(second);
             workspace.panes.append(second);
@@ -1265,6 +1501,8 @@ private:
                 PaneState pane;
                 for (const auto& entry : paneObject.value("paths").toArray())
                     if (entry.isString() && !entry.toString().isEmpty()) pane.paths.append(entry.toString());
+                for (const auto& entry : paneObject.value("lockedPaths").toArray())
+                    if (entry.isString()) pane.lockedPaths.append(entry.toString());
                 pane.currentTab = paneObject.value("currentTab").toInt(0);
                 panes.append(pane);
             }
@@ -1300,6 +1538,9 @@ private:
                 QJsonArray paths;
                 for (const auto& path : pane->locationPaths()) paths.append(path);
                 paneObject.insert("paths", paths);
+                QJsonArray lockedPaths;
+                for (const auto& path : pane->lockedLocationPaths()) lockedPaths.append(path);
+                paneObject.insert("lockedPaths", lockedPaths);
                 paneObject.insert("currentTab", pane->selectedTab());
                 paneArray.append(paneObject);
             }
