@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(LightweightFileManager VERSION 0.1.0 LANGUAGES CXX)
+project(LightweightFileManager VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,6 +35,10 @@ add_custom_target(fm_core_build DEPENDS "${RUST_LIBRARY}" "${RUST_BRIDGE_HEADER}
 
 qt_add_executable(lightweight-file-manager
     src/main.cpp
+)
+qt_add_resources(lightweight-file-manager app_icon
+    PREFIX "/icons"
+    FILES src/app.ico
 )
 if(WIN32)
     set(LIGHTWEIGHT_FILE_MANAGER_OUTPUT_DIR "${CMAKE_BINARY_DIR}/app" CACHE PATH "Application output directory")

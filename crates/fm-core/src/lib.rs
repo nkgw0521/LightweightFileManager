@@ -1,5 +1,7 @@
 use serde::Serialize;
-use std::{fs, io, path::Path, time::UNIX_EPOCH};
+use std::{fs, io, path::{Path, PathBuf}, sync::atomic::{AtomicU64, Ordering}, time::UNIX_EPOCH};
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Serialize)]
 struct FileEntry {
@@ -18,6 +20,7 @@ mod ffi {
         fn rename_path(from: &str, to: &str) -> String;
         fn remove_path(path: &str) -> String;
         fn copy_path(from: &str, to: &str) -> String;
+        fn copy_path_replace(from: &str, to: &str) -> String;
         fn move_path(from: &str, to: &str) -> String;
     }
 }
@@ -102,6 +105,46 @@ fn copy_path(from: &str, to: &str) -> String {
         return "destination already exists".to_owned();
     }
     error_text(copy_entry(Path::new(from), destination))
+}
+
+fn temporary_sibling(destination: &Path) -> PathBuf {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let name = destination.file_name().unwrap_or_default().to_string_lossy();
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(".{name}.lwf-copy-{}-{sequence}", std::process::id()))
+}
+
+fn copy_path_replace(from: &str, to: &str) -> String {
+    let source = Path::new(from);
+    let destination = Path::new(to);
+    if source == destination {
+        return String::new();
+    }
+    let staged = temporary_sibling(destination);
+    if let Err(error) = copy_entry(source, &staged) {
+        let _ = remove_path(&staged.to_string_lossy());
+        return error.to_string();
+    }
+
+    let backup = temporary_sibling(destination);
+    let had_destination = destination.exists();
+    if had_destination {
+        if let Err(error) = fs::rename(destination, &backup) {
+            let _ = remove_path(&staged.to_string_lossy());
+            return error.to_string();
+        }
+    }
+    if let Err(error) = fs::rename(&staged, destination) {
+        if had_destination {
+            let _ = fs::rename(&backup, destination);
+        }
+        let _ = remove_path(&staged.to_string_lossy());
+        return error.to_string();
+    }
+    if had_destination {
+        let _ = remove_path(&backup.to_string_lossy());
+    }
+    String::new()
 }
 
 fn move_path(from: &str, to: &str) -> String {

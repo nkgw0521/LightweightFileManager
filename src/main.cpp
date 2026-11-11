@@ -58,10 +58,13 @@
 #include <QMouseEvent>
 #include <QDragEnterEvent>
 #include <QDropEvent>
+#include <QDragMoveEvent>
+#include <QRegularExpression>
 #include <QScrollArea>
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrentRun>
 #include <functional>
+#include <algorithm>
 #include <memory>
 #include <vector>
 #include <rust/cxx.h>
@@ -168,6 +171,13 @@ QString coreCopyPath(const QString& from, const QString& to) {
                                 rust::Str(toUtf8.data(), toUtf8.size())));
 }
 
+QString coreCopyPathReplace(const QString& from, const QString& to) {
+    const auto fromUtf8 = from.toUtf8().toStdString();
+    const auto toUtf8 = to.toUtf8().toStdString();
+    return rustString(copy_path_replace(rust::Str(fromUtf8.data(), fromUtf8.size()),
+                                        rust::Str(toUtf8.data(), toUtf8.size())));
+}
+
 QString coreMovePath(const QString& from, const QString& to) {
     const auto fromUtf8 = from.toUtf8().toStdString();
     const auto toUtf8 = to.toUtf8().toStdString();
@@ -176,6 +186,8 @@ QString coreMovePath(const QString& from, const QString& to) {
 }
 
 QIcon applicationIcon() {
+    const QIcon embedded(QStringLiteral(":/icons/src/app.ico"));
+    if (!embedded.isNull()) return embedded;
     QPixmap pixmap(64, 64);
     pixmap.fill(Qt::transparent);
     QPainter painter(&pixmap);
@@ -333,6 +345,50 @@ QIcon splitIndicatorIcon(int paneCount) {
     return QIcon(pixmap);
 }
 
+class FileTableWidget final : public QTableWidget {
+public:
+    using QTableWidget::QTableWidget;
+    std::function<QStringList()> selectedFilePaths;
+    std::function<void(const QList<QUrl>&, const QPoint&)> filesDropped;
+
+protected:
+    void startDrag(Qt::DropActions) override {
+        if (!selectedFilePaths) return;
+        const auto paths = selectedFilePaths();
+        if (paths.isEmpty()) return;
+        auto* mimeData = new QMimeData;
+        QList<QUrl> urls;
+        for (const auto& path : paths) urls.append(QUrl::fromLocalFile(path));
+        mimeData->setUrls(urls);
+#if defined(Q_OS_WIN)
+        QByteArray effect(sizeof(quint32), Qt::Uninitialized);
+        qToLittleEndian<quint32>(1, reinterpret_cast<uchar*>(effect.data()));
+        mimeData->setData(QStringLiteral("Preferred DropEffect"), effect);
+#endif
+        QDrag drag(this);
+        drag.setMimeData(mimeData);
+        drag.exec(Qt::CopyAction, Qt::CopyAction);
+    }
+
+    void dragEnterEvent(QDragEnterEvent* event) override {
+        if (event->mimeData()->hasUrls()) event->acceptProposedAction();
+        else QTableWidget::dragEnterEvent(event);
+    }
+
+    void dragMoveEvent(QDragMoveEvent* event) override {
+        if (event->mimeData()->hasUrls()) event->acceptProposedAction();
+        else QTableWidget::dragMoveEvent(event);
+    }
+
+    void dropEvent(QDropEvent* event) override {
+        if (event->mimeData()->hasUrls() && filesDropped) {
+            filesDropped(event->mimeData()->urls(), event->position().toPoint());
+            event->setDropAction(Qt::CopyAction);
+            event->accept();
+        } else QTableWidget::dropEvent(event);
+    }
+};
+
 class FilePane final : public QWidget {
 public:
     FilePane(const QString& startPath, const QStringList& savedPaths, const QStringList& savedLockedPaths, int selectedTab,
@@ -366,7 +422,12 @@ public:
         pathBar->setPlaceholderText(tr("フォルダーのパス"));
         layout->addWidget(pathBar);
 
-        m_table = new QTableWidget(0, 4, this);
+        m_filterBar = new QLineEdit(this);
+        m_filterBar->setPlaceholderText(tr("正規表現でファイル名を絞り込み"));
+        m_filterBar->setClearButtonEnabled(true);
+        layout->addWidget(m_filterBar);
+
+        m_table = new FileTableWidget(0, 4, this);
         m_table->setHorizontalHeaderLabels({tr("名前"), tr("拡張子"), tr("更新日時"), tr("サイズ")});
         m_table->setSelectionBehavior(QAbstractItemView::SelectRows);
         m_table->setSelectionMode(QAbstractItemView::ExtendedSelection);
@@ -375,20 +436,35 @@ public:
         m_table->setShowGrid(false);
         m_table->setFocusPolicy(Qt::StrongFocus);
         m_table->setContextMenuPolicy(Qt::CustomContextMenu);
+        m_table->setDragEnabled(true);
+        m_table->setAcceptDrops(true);
+        m_table->setDropIndicatorShown(true);
+        m_table->setDragDropMode(QAbstractItemView::DragDrop);
         m_table->installEventFilter(this);
         m_table->viewport()->installEventFilter(this);
         m_table->verticalHeader()->hide();
-        m_table->setSortingEnabled(true);
+        m_table->setSortingEnabled(false);
         m_table->horizontalHeader()->setSectionsClickable(true);
         m_table->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+        m_table->horizontalHeader()->setStyleSheet("QHeaderView { background-color: #1d242e; }");
+        m_table->horizontalHeader()->viewport()->setStyleSheet("background-color: #1d242e;");
         m_table->horizontalHeader()->resizeSection(0, 360);
         m_table->horizontalHeader()->resizeSection(1, 90);
         m_table->horizontalHeader()->resizeSection(2, 150);
         m_table->horizontalHeader()->resizeSection(3, 100);
-        m_table->sortItems(0, Qt::AscendingOrder);
+        m_table->horizontalHeader()->setSortIndicatorShown(true);
+        connect(m_table->horizontalHeader(), &QHeaderView::sectionClicked, this, [this](int column) {
+            if (column == m_sortColumn) m_sortOrder = m_sortOrder == Qt::AscendingOrder ? Qt::DescendingOrder : Qt::AscendingOrder;
+            else { m_sortColumn = column; m_sortOrder = Qt::AscendingOrder; }
+            m_table->horizontalHeader()->setSortIndicator(m_sortColumn, m_sortOrder);
+            sortRows();
+        });
         layout->addWidget(m_table, 1);
         m_tabs->installEventFilter(this);
         addTabButton->installEventFilter(this);
+        m_filterBar->installEventFilter(this);
+        m_table->selectedFilePaths = [this] { return selectedPaths(); };
+        m_table->filesDropped = [this](const QList<QUrl>& urls, const QPoint& point) { dropUrls(urls, point); };
 
         connect(pathBar, &QLineEdit::returnPressed, this, [this, pathBar] {
             activate();
@@ -401,6 +477,7 @@ public:
         connect(m_tabs, &QTabBar::tabCloseRequested, this, [this](int index) {
             if (isTabLocked(index)) return;
             if (m_tabs->count() > 1) {
+                removeLockedTabIndex(index);
                 m_tabs->removeTab(index);
                 if (m_tabs->count() > 0) m_tabs->setCurrentIndex(qMin(index, m_tabs->count() - 1));
                 notifyChanged();
@@ -412,15 +489,16 @@ public:
             QMenu menu(m_tabs);
             auto* toggleLock = menu.addAction(isTabLocked(index) ? tr("タブのロックを解除") : tr("タブをロック"));
             if (menu.exec(m_tabs->mapToGlobal(position)) != toggleLock) return;
-            const auto path = m_tabs->tabData(index).toString();
-            if (isTabLocked(index)) m_lockedPaths.remove(path);
-            else m_lockedPaths.insert(path);
+            if (isTabLocked(index)) m_lockedTabs.remove(index);
+            else m_lockedTabs.insert(index);
             updateTabLabel(index);
             notifyChanged();
         });
+        connect(m_tabs, &QTabBar::tabMoved, this, [this](int from, int to) { moveLockedTabIndex(from, to); });
         connect(m_tabs, &QTabBar::currentChanged, this, [this](int index) {
             const auto destination = m_tabs->tabData(index).toString();
             if (!destination.isEmpty()) {
+                m_table->clearSelection();
                 m_path = destination;
                 m_pathBar->setText(QDir::toNativeSeparators(m_path));
                 refresh();
@@ -445,6 +523,7 @@ public:
         connect(m_table, &QWidget::customContextMenuRequested, this, [this](const QPoint& position) {
             showContextMenu(position);
         });
+        connect(m_filterBar, &QLineEdit::textChanged, this, [this] { applyFilter(); });
         addShortcut(QKeySequence::Copy, [this] { copySelection(false); });
         addShortcut(QKeySequence::Cut, [this] { copySelection(true); });
         addShortcut(QKeySequence::Paste, [this] { pasteClipboard(); });
@@ -453,6 +532,9 @@ public:
         addShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+N")), [this] { createFolder(); });
         addShortcut(QKeySequence(Qt::Key_Return), [this] { openSelection(); });
         addShortcut(QKeySequence(Qt::Key_Enter), [this] { openSelection(); });
+        addShortcut(QKeySequence(Qt::Key_Backspace), [this] { goUp(); });
+        addShortcut(QKeySequence(Qt::Key_Home), [this] { selectBoundaryRow(false); });
+        addShortcut(QKeySequence(Qt::Key_End), [this] { selectBoundaryRow(true); });
 
         {
             const QSignalBlocker blocker(m_tabs);
@@ -462,11 +544,20 @@ public:
             }
             if (m_tabs->count() == 0) addLocationTab(startPath);
             m_tabs->setCurrentIndex(qBound(0, selectedTab, m_tabs->count() - 1));
-            for (const auto& lockedPath : savedLockedPaths) m_lockedPaths.insert(QDir::cleanPath(lockedPath));
+            for (const auto& value : savedLockedPaths) {
+                if (value.startsWith('@')) {
+                    bool ok = false;
+                    const auto index = value.mid(1).toInt(&ok);
+                    if (ok && index >= 0 && index < m_tabs->count()) m_lockedTabs.insert(index);
+                } else {
+                    for (int i = 0; i < m_tabs->count(); ++i)
+                        if (m_tabs->tabData(i).toString() == QDir::cleanPath(value)) m_lockedTabs.insert(i);
+                }
+            }
             for (int i = 0; i < m_tabs->count(); ++i) updateTabLabel(i);
         }
         m_path = m_tabs->tabData(m_tabs->currentIndex()).toString();
-        m_pathBar->setText(m_path);
+        m_pathBar->setText(QDir::toNativeSeparators(m_path));
         m_history = {m_path};
         m_historyIndex = 0;
         refresh();
@@ -477,7 +568,12 @@ public:
         for (int i = 0; i < m_tabs->count(); ++i) paths.append(m_tabs->tabData(i).toString());
         return paths;
     }
-    QStringList lockedLocationPaths() const { return m_lockedPaths.values(); }
+    QStringList lockedLocationPaths() const {
+        QStringList values;
+        for (const auto index : m_lockedTabs) values.append(QStringLiteral("@%1").arg(index));
+        return values;
+    }
+    int fileCount() const { return m_fileCount; }
 
     int selectedTab() const { return m_tabs->currentIndex(); }
     QString currentPath() const { return m_path; }
@@ -489,6 +585,7 @@ public:
     }
     void setActive(bool active) {
         if (property("activePane").toBool() == active) return;
+        if (!active) m_table->clearSelection();
         setProperty("activePane", active);
         style()->unpolish(this);
         style()->polish(this);
@@ -553,7 +650,8 @@ private:
     QString m_path;
     QTabBar* m_tabs = nullptr;
     QLineEdit* m_pathBar = nullptr;
-    QTableWidget* m_table = nullptr;
+    QLineEdit* m_filterBar = nullptr;
+    FileTableWidget* m_table = nullptr;
     QFileIconProvider m_iconProvider;
     quint64 m_requestId = 0;
     std::function<void()> m_onChanged;
@@ -561,11 +659,34 @@ private:
     std::function<void()> m_onHistoryChanged;
     QStringList m_history;
     int m_historyIndex = -1;
+    int m_fileCount = 0;
+    int m_sortColumn = 0;
+    Qt::SortOrder m_sortOrder = Qt::AscendingOrder;
     bool m_replayingHistory = false;
-    QSet<QString> m_lockedPaths;
+    QSet<int> m_lockedTabs;
 
     bool isTabLocked(int index) const {
-        return index >= 0 && m_lockedPaths.contains(m_tabs->tabData(index).toString());
+        return index >= 0 && m_lockedTabs.contains(index);
+    }
+
+    void removeLockedTabIndex(int removed) {
+        QSet<int> adjusted;
+        for (const auto index : m_lockedTabs) {
+            if (index < removed) adjusted.insert(index);
+            else if (index > removed) adjusted.insert(index - 1);
+        }
+        m_lockedTabs = adjusted;
+    }
+
+    void moveLockedTabIndex(int from, int to) {
+        QSet<int> adjusted;
+        for (const auto index : m_lockedTabs) {
+            if (index == from) adjusted.insert(to);
+            else if (from < to && index > from && index <= to) adjusted.insert(index - 1);
+            else if (to < from && index >= to && index < from) adjusted.insert(index + 1);
+            else adjusted.insert(index);
+        }
+        m_lockedTabs = adjusted;
     }
 
     void updateTabLabel(int index) {
@@ -616,6 +737,7 @@ private:
         if (!QFileInfo(clean).isDir()) return;
         const auto current = m_tabs->currentIndex();
         if (current >= 0 && m_tabs->tabData(current).toString() == clean) return;
+        m_table->clearSelection();
         if (current >= 0 && isTabLocked(current)) {
             addLocationTab(clean);
             m_path = clean;
@@ -644,6 +766,7 @@ private:
     }
 
     void refresh() {
+        m_table->clearSelection();
         const auto utf8Path = m_path.toUtf8().toStdString();
         const auto requestId = ++m_requestId;
         auto* watcher = new QFutureWatcher<QString>(this);
@@ -659,48 +782,95 @@ private:
 
     void populate(const QString& json) {
         const auto document = QJsonDocument::fromJson(json.toUtf8());
-        auto entries = document.array();
-        const auto parentPath = QFileInfo(m_path).absolutePath();
-        if (parentPath != m_path) {
-            QJsonObject parentEntry;
-            parentEntry.insert("name", "..");
-            parentEntry.insert("path", parentPath);
-            parentEntry.insert("is_dir", true);
-            parentEntry.insert("size", 0);
-            parentEntry.insert("modified", 0);
-            entries.prepend(parentEntry);
-        }
-        QJsonObject currentEntry;
-        currentEntry.insert("name", ".");
-        currentEntry.insert("path", m_path);
-        currentEntry.insert("is_dir", true);
-        currentEntry.insert("size", 0);
-        currentEntry.insert("modified", 0);
-        entries.prepend(currentEntry);
-        const auto sorting = m_table->isSortingEnabled();
+        const auto entries = document.array();
         m_table->setSortingEnabled(false);
         m_table->setRowCount(entries.size());
+        m_fileCount = 0;
         for (qsizetype row = 0; row < entries.size(); ++row) {
             const auto entry = entries.at(row).toObject();
             const auto name = entry.value("name").toString();
             const auto path = entry.value("path").toString();
             const auto isDir = entry.value("is_dir").toBool();
+            if (!isDir) ++m_fileCount;
             auto* nameItem = new QTableWidgetItem(name);
             nameItem->setIcon(m_iconProvider.icon(QFileInfo(path)));
             nameItem->setData(Qt::UserRole, path);
             nameItem->setData(Qt::UserRole + 1, isDir);
             auto* extensionItem = new QTableWidgetItem(isDir ? QString{} : QFileInfo(name).suffix());
             auto* timeItem = new QTableWidgetItem(QDateTime::fromSecsSinceEpoch(entry.value("modified").toInteger()).toString("yyyy/MM/dd HH:mm"));
+            timeItem->setData(Qt::UserRole + 2, entry.value("modified").toInteger());
             const auto size = entry.value("size").toInteger();
             auto* sizeItem = new QTableWidgetItem(isDir ? QString{} : QLocale().formattedDataSize(size));
+            sizeItem->setData(Qt::UserRole + 2, size);
             sizeItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
             m_table->setItem(static_cast<int>(row), 0, nameItem);
             m_table->setItem(static_cast<int>(row), 1, extensionItem);
             m_table->setItem(static_cast<int>(row), 2, timeItem);
             m_table->setItem(static_cast<int>(row), 3, sizeItem);
         }
-        m_table->setSortingEnabled(sorting);
-        m_table->sortItems(m_table->horizontalHeader()->sortIndicatorSection(), m_table->horizontalHeader()->sortIndicatorOrder());
+        sortRows(false);
+        applyFilter();
+        if (m_onChanged) m_onChanged();
+    }
+
+    void sortRows(bool preserveSelection = true) {
+        using Row = QVector<QTableWidgetItem*>;
+        const auto selected = preserveSelection ? selectedPaths() : QStringList{};
+        QVector<Row> rows;
+        rows.reserve(m_table->rowCount());
+        for (int row = 0; row < m_table->rowCount(); ++row) {
+            Row items;
+            for (int column = 0; column < m_table->columnCount(); ++column) items.append(m_table->takeItem(row, column));
+            rows.append(std::move(items));
+        }
+        std::stable_sort(rows.begin(), rows.end(), [this](const Row& left, const Row& right) {
+            const bool leftDir = left[0]->data(Qt::UserRole + 1).toBool();
+            const bool rightDir = right[0]->data(Qt::UserRole + 1).toBool();
+            if (leftDir != rightDir) return leftDir;
+            const auto* a = left[m_sortColumn];
+            const auto* b = right[m_sortColumn];
+            int comparison = 0;
+            if (m_sortColumn == 2 || m_sortColumn == 3) {
+                const auto av = a->data(Qt::UserRole + 2).toLongLong();
+                const auto bv = b->data(Qt::UserRole + 2).toLongLong();
+                comparison = av < bv ? -1 : av > bv ? 1 : 0;
+            } else {
+                comparison = QString::localeAwareCompare(a->text(), b->text());
+            }
+            return m_sortOrder == Qt::AscendingOrder ? comparison < 0 : comparison > 0;
+        });
+        m_table->setRowCount(0);
+        m_table->setRowCount(rows.size());
+        for (int row = 0; row < rows.size(); ++row)
+            for (int column = 0; column < rows[row].size(); ++column)
+                m_table->setItem(row, column, rows[row][column]);
+        m_table->horizontalHeader()->setSortIndicator(m_sortColumn, m_sortOrder);
+        for (const auto& path : selected) {
+            for (int row = 0; row < m_table->rowCount(); ++row)
+                if (m_table->item(row, 0)->data(Qt::UserRole).toString() == path) m_table->selectRow(row);
+        }
+    }
+
+    void applyFilter() {
+        const QRegularExpression expression(m_filterBar->text(), QRegularExpression::CaseInsensitiveOption);
+        const auto valid = m_filterBar->text().isEmpty() || expression.isValid();
+        m_filterBar->setStyleSheet(valid ? QString{} : QStringLiteral("QLineEdit { border: 1px solid #e45b64; }"));
+        m_table->clearSelection();
+        for (int row = 0; row < m_table->rowCount(); ++row) {
+            const auto name = m_table->item(row, 0)->text();
+            m_table->setRowHidden(row, valid && !m_filterBar->text().isEmpty() && !expression.match(name).hasMatch());
+        }
+    }
+
+    void selectBoundaryRow(bool last) {
+        const auto count = m_table->rowCount();
+        for (int step = 0; step < count; ++step) {
+            const auto row = last ? count - 1 - step : step;
+            if (m_table->isRowHidden(row)) continue;
+            m_table->setCurrentCell(row, 0);
+            m_table->selectRow(row);
+            return;
+        }
     }
 
     void addShortcut(const QKeySequence& sequence, std::function<void()> action) {
@@ -715,7 +885,11 @@ private:
         for (const auto& index : m_table->selectionModel()->selectedRows()) rows.insert(index.row());
         for (const auto row : rows) {
             const auto* item = m_table->item(row, 0);
-            if (item) paths.append(item->data(Qt::UserRole).toString());
+            if (!item) continue;
+            const auto path = item->data(Qt::UserRole).toString();
+            const QFileInfo info(path);
+            if (path.isEmpty() || !info.exists() || QDir::cleanPath(info.absolutePath()) != QDir::cleanPath(m_path)) continue;
+            paths.append(path);
         }
         return paths;
     }
@@ -823,20 +997,58 @@ private:
                 moving = qFromLittleEndian<quint32>(reinterpret_cast<const uchar*>(effect.constData())) == 2;
         }
 #endif
+        pasteUrls(urls, m_path, moving);
+    }
+
+    void dropUrls(const QList<QUrl>& urls, const QPoint& position) {
+        auto destination = m_path;
+        const auto index = m_table->indexAt(position);
+        if (index.isValid()) {
+            const auto* item = m_table->item(index.row(), 0);
+            if (item && item->data(Qt::UserRole + 1).toBool()) destination = item->data(Qt::UserRole).toString();
+        }
+        pasteUrls(urls, destination, false);
+    }
+
+    void pasteUrls(const QList<QUrl>& urls, const QString& destinationDirectory, bool moving) {
         QStringList errors;
-        QStringList affectedDirectories{m_path};
+        QStringList affectedDirectories{destinationDirectory};
+        bool cancelled = false;
+        bool movedAny = false;
+        bool skipped = false;
         for (const auto& url : urls) {
             if (!url.isLocalFile()) continue;
             const auto source = url.toLocalFile();
-            const auto destination = QDir(m_path).filePath(QFileInfo(source).fileName());
-            if (QDir::cleanPath(source) == QDir::cleanPath(destination)) continue;
-            const auto error = moving ? coreMovePath(source, destination) : coreCopyPath(source, destination);
+            const auto destination = QDir(destinationDirectory).filePath(QFileInfo(source).fileName());
+            if (QDir::cleanPath(source) == QDir::cleanPath(destination)) { skipped = true; continue; }
+            const QFileInfo destinationInfo(destination);
+            auto replace = false;
+            if (destinationInfo.exists()) {
+                QMessageBox choice(this);
+                choice.setWindowTitle(tr("同名ファイルがあります"));
+                choice.setText(tr("%1 は既に存在します。").arg(QFileInfo(destination).fileName()));
+                auto* overwrite = choice.addButton(tr("上書き"), QMessageBox::AcceptRole);
+                auto* skip = choice.addButton(tr("スキップ"), QMessageBox::DestructiveRole);
+                auto* cancel = choice.addButton(tr("キャンセル"), QMessageBox::RejectRole);
+                overwrite->setEnabled(!moving);
+                choice.setDefaultButton(skip);
+                choice.setEscapeButton(cancel);
+                choice.exec();
+                if (choice.clickedButton() == cancel) { cancelled = true; break; }
+                if (choice.clickedButton() == skip || choice.clickedButton() == nullptr) { skipped = true; continue; }
+                replace = choice.clickedButton() == overwrite;
+            }
+            const auto error = moving ? coreMovePath(source, destination)
+                                      : replace ? coreCopyPathReplace(source, destination) : coreCopyPath(source, destination);
             if (!error.isEmpty()) errors.append(QFileInfo(source).fileName() + QStringLiteral(": ") + error);
-            else affectedDirectories.append(QFileInfo(source).absolutePath());
+            else {
+                affectedDirectories.append(QFileInfo(source).absolutePath());
+                movedAny = movedAny || moving;
+            }
         }
         refreshOpenPanes(affectedDirectories);
         if (!errors.isEmpty()) QMessageBox::warning(this, tr("貼り付けできません"), errors.join('\n'));
-        else if (moving) QApplication::clipboard()->clear();
+        else if (moving && movedAny && !cancelled && !skipped) QApplication::clipboard()->clear();
     }
 
     void createFolder() {
@@ -875,6 +1087,9 @@ private:
         auto* cancelButton = confirmation.addButton(tr("キャンセル"), QMessageBox::RejectRole);
         confirmation.setDefaultButton(qobject_cast<QPushButton*>(cancelButton));
         confirmation.setEscapeButton(cancelButton);
+        confirmation.setStyleSheet("QPushButton:default { border: 2px solid #79aaff; background: #304966; color: white; font-weight: 600; } QPushButton { min-width: 90px; min-height: 28px; }");
+        deleteButton->setStyleSheet("QPushButton { background: #653840; color: white; }");
+        cancelButton->setFocus(Qt::OtherFocusReason);
         confirmation.exec();
         const auto answer = confirmation.clickedButton() == deleteButton ? QMessageBox::Yes : QMessageBox::No;
         if (answer != QMessageBox::Yes) return;
@@ -1008,7 +1223,7 @@ public:
         auto* aboutAction = helpMenu->addAction(tr("バージョン情報"));
         connect(aboutAction, &QAction::triggered, this, [this] {
             QMessageBox::about(this, tr("Lightweight File Managerについて"),
-                               tr("Lightweight File Manager\nVersion 0.1.0\n\nRust + Qt 6 Widgets"));
+                               tr("Lightweight File Manager\nVersion 0.2.0\n\nRust + Qt 6 Widgets"));
         });
 
         auto* toolbar = new QToolBar(tr("ナビゲーション"), content);
@@ -1259,7 +1474,7 @@ private:
             const auto initialPath = !paneState.paths.isEmpty() && QFileInfo(paneState.paths.first()).isDir()
                 ? paneState.paths.first() : QDir::homePath();
             auto* pane = new FilePane(initialPath, paneState.paths, paneState.lockedPaths, paneState.currentTab,
-                                      [this] { if (!m_restoring) saveSettings(); }, workspace.splitter);
+                                      [this] { if (!m_restoring) saveSettings(); updateStatus(); }, workspace.splitter);
             attachPane(pane);
             workspace.splitter->addWidget(pane);
             workspace.panes.append(pane);
@@ -1388,7 +1603,8 @@ private:
             const auto path = workspace.panes.first()->currentPath();
             PaneState pane;
             pane.paths = {path};
-            auto* second = new FilePane(path, pane.paths, pane.lockedPaths, 0, [this] { if (!m_restoring) saveSettings(); }, workspace.splitter);
+            auto* second = new FilePane(path, pane.paths, pane.lockedPaths, 0,
+                                        [this] { if (!m_restoring) saveSettings(); updateStatus(); }, workspace.splitter);
             attachPane(second);
             workspace.splitter->addWidget(second);
             workspace.panes.append(second);
@@ -1428,7 +1644,10 @@ private:
         updateSplitButton(workspace.visiblePaneCount);
         const auto paneLabel = workspace.visiblePaneCount > 1 ? tr("2 ペイン表示") : tr("1 ペイン表示");
         const auto direction = workspace.splitter->orientation() == Qt::Horizontal ? tr("左右") : tr("上下");
+        auto* pane = currentPane();
+        const auto countLabel = tr("%1 ファイル").arg(pane ? pane->fileCount() : 0);
         statusBar()->showMessage(paneLabel + (workspace.visiblePaneCount > 1 ? QStringLiteral("（") + direction + QStringLiteral("）") : QString{})
+                                 + QStringLiteral("　|　") + countLabel
                                  + tr("　|　フォルダーをダブルクリック　ファイルを右クリックで操作"));
     }
 
