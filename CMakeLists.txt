@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 6.4 REQUIRED COMPONENTS Widgets Concurrent)
+find_package(Qt6 6.4 REQUIRED COMPONENTS Widgets Concurrent Svg)
 find_program(CARGO_EXECUTABLE cargo REQUIRED)
 
 if(WIN32)
@@ -38,7 +38,7 @@ qt_add_executable(lightweight-file-manager
 )
 qt_add_resources(lightweight-file-manager app_icon
     PREFIX "/icons"
-    FILES src/app.ico
+    FILES src/app.ico src/app-icon.svg
 )
 if(WIN32)
     set(LIGHTWEIGHT_FILE_MANAGER_OUTPUT_DIR "${CMAKE_BINARY_DIR}/app" CACHE PATH "Application output directory")
@@ -49,7 +49,7 @@ if(WIN32)
 endif()
 add_dependencies(lightweight-file-manager fm_core_build)
 target_include_directories(lightweight-file-manager PRIVATE "${RUST_TARGET_DIR}/cxxbridge")
-target_link_libraries(lightweight-file-manager PRIVATE Qt6::Widgets Qt6::Concurrent "${RUST_LIBRARY}")
+target_link_libraries(lightweight-file-manager PRIVATE Qt6::Widgets Qt6::Concurrent Qt6::Svg "${RUST_LIBRARY}")
 if(WIN32)
     target_link_libraries(lightweight-file-manager PRIVATE ws2_32 userenv bcrypt advapi32 ntdll)
 elseif(UNIX)

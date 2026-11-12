@@ -25,6 +25,7 @@
 #include <QHBoxLayout>
 #include <QAbstractItemView>
 #include <QLocale>
+#include <QCollator>
 #include <QStatusBar>
 #include <QStackedWidget>
 #include <QToolButton>
@@ -60,6 +61,7 @@
 #include <QDropEvent>
 #include <QDragMoveEvent>
 #include <QRegularExpression>
+#include <QSvgRenderer>
 #include <QScrollArea>
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrentRun>
@@ -186,33 +188,11 @@ QString coreMovePath(const QString& from, const QString& to) {
 }
 
 QIcon applicationIcon() {
-    const QIcon embedded(QStringLiteral(":/icons/src/app.ico"));
-    if (!embedded.isNull()) return embedded;
-    QPixmap pixmap(64, 64);
+    QSvgRenderer renderer(QStringLiteral(":/icons/src/app-icon.svg"));
+    QPixmap pixmap(128, 128);
     pixmap.fill(Qt::transparent);
     QPainter painter(&pixmap);
-    painter.setRenderHint(QPainter::Antialiasing);
-    painter.setPen(Qt::NoPen);
-    painter.setBrush(QColor("#1b2532"));
-    painter.drawRoundedRect(QRectF(2, 2, 60, 60), 14, 14);
-    painter.setPen(QPen(QColor("#74a8f7"), 3, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-    painter.setBrush(QColor("#25384f"));
-    painter.drawRoundedRect(QRectF(13, 15, 38, 34), 4, 4);
-    painter.drawLine(QPointF(32, 16), QPointF(32, 48));
-    painter.setPen(QPen(QColor("#9fc0ff"), 2, Qt::SolidLine, Qt::RoundCap));
-    painter.drawLine(QPointF(20, 27), QPointF(27, 27));
-    painter.drawLine(QPointF(37, 27), QPointF(44, 27));
-    painter.setPen(Qt::NoPen);
-    painter.setBrush(QColor("#f3bd58"));
-    QPainterPath folder;
-    folder.moveTo(16, 35);
-    folder.lineTo(26, 35);
-    folder.lineTo(29, 39);
-    folder.lineTo(47, 39);
-    folder.lineTo(45, 47);
-    folder.lineTo(16, 47);
-    folder.closeSubpath();
-    painter.drawPath(folder);
+    renderer.render(&painter);
     return QIcon(pixmap);
 }
 
@@ -367,7 +347,7 @@ protected:
 #endif
         QDrag drag(this);
         drag.setMimeData(mimeData);
-        drag.exec(Qt::CopyAction, Qt::CopyAction);
+        drag.exec(Qt::CopyAction | Qt::MoveAction, Qt::CopyAction);
     }
 
     void dragEnterEvent(QDragEnterEvent* event) override {
@@ -420,12 +400,20 @@ public:
         pathBar->setText(QDir::toNativeSeparators(m_path));
         pathBar->setClearButtonEnabled(true);
         pathBar->setPlaceholderText(tr("フォルダーのパス"));
-        layout->addWidget(pathBar);
-
+        auto* locationRow = new QHBoxLayout;
+        locationRow->setContentsMargins(0, 0, 0, 0);
+        locationRow->setSpacing(6);
+        locationRow->addWidget(pathBar, 1);
+        auto* filterLabel = new QLabel(tr("フィルター"), this);
+        locationRow->addWidget(filterLabel);
         m_filterBar = new QLineEdit(this);
-        m_filterBar->setPlaceholderText(tr("正規表現でファイル名を絞り込み"));
+        m_filterBar->setPlaceholderText(tr("正規表現"));
         m_filterBar->setClearButtonEnabled(true);
-        layout->addWidget(m_filterBar);
+        m_filterBar->setMaximumWidth(180);
+        m_filterBar->setMinimumWidth(110);
+        m_filterBar->setToolTip(tr("正規表現でファイル名を絞り込み"));
+        locationRow->addWidget(m_filterBar);
+        layout->addLayout(locationRow);
 
         m_table = new FileTableWidget(0, 4, this);
         m_table->setHorizontalHeaderLabels({tr("名前"), tr("拡張子"), tr("更新日時"), tr("サイズ")});
@@ -440,6 +428,7 @@ public:
         m_table->setAcceptDrops(true);
         m_table->setDropIndicatorShown(true);
         m_table->setDragDropMode(QAbstractItemView::DragDrop);
+        m_table->setDefaultDropAction(Qt::CopyAction);
         m_table->installEventFilter(this);
         m_table->viewport()->installEventFilter(this);
         m_table->verticalHeader()->hide();
@@ -816,6 +805,9 @@ private:
     void sortRows(bool preserveSelection = true) {
         using Row = QVector<QTableWidgetItem*>;
         const auto selected = preserveSelection ? selectedPaths() : QStringList{};
+        QCollator collator;
+        collator.setNumericMode(true);
+        collator.setCaseSensitivity(Qt::CaseInsensitive);
         QVector<Row> rows;
         rows.reserve(m_table->rowCount());
         for (int row = 0; row < m_table->rowCount(); ++row) {
@@ -823,7 +815,7 @@ private:
             for (int column = 0; column < m_table->columnCount(); ++column) items.append(m_table->takeItem(row, column));
             rows.append(std::move(items));
         }
-        std::stable_sort(rows.begin(), rows.end(), [this](const Row& left, const Row& right) {
+        std::stable_sort(rows.begin(), rows.end(), [this, collator](const Row& left, const Row& right) {
             const bool leftDir = left[0]->data(Qt::UserRole + 1).toBool();
             const bool rightDir = right[0]->data(Qt::UserRole + 1).toBool();
             if (leftDir != rightDir) return leftDir;
@@ -835,7 +827,7 @@ private:
                 const auto bv = b->data(Qt::UserRole + 2).toLongLong();
                 comparison = av < bv ? -1 : av > bv ? 1 : 0;
             } else {
-                comparison = QString::localeAwareCompare(a->text(), b->text());
+                comparison = collator.compare(a->text(), b->text());
             }
             return m_sortOrder == Qt::AscendingOrder ? comparison < 0 : comparison > 0;
         });
@@ -904,8 +896,17 @@ private:
     void showContextMenu(const QPoint& position) {
         activate();
         const auto index = m_table->indexAt(position);
-        if (index.isValid() && !m_table->selectionModel()->isSelected(index)) {
-            m_table->selectRow(index.row());
+        if (index.isValid()) {
+            bool rowSelected = false;
+            for (const auto& selected : m_table->selectionModel()->selectedRows())
+                if (selected.row() == index.row()) { rowSelected = true; break; }
+            if (!rowSelected) {
+                m_table->clearSelection();
+                m_table->setCurrentCell(index.row(), index.column());
+                m_table->selectRow(index.row());
+            }
+        } else {
+            m_table->clearSelection();
         }
         const auto paths = selectedPaths();
         QMenu menu(m_table);
