@@ -1151,7 +1151,7 @@ public:
             QTabBar::tab:selected { color: #e6eaf0; background: #2a3442; border-radius: 5px; }
             QTableWidget { color: #d9e0e9; background: #141920; alternate-background-color: #171e27; border: 0; selection-background-color: #365273; selection-color: #ffffff; outline: 0; }
             QTableWidget::item:selected { background: #365273; color: #ffffff; }
-            QHeaderView::section { color: #aeb8c6; background: #1d242e; border: 0; border-bottom: 1px solid #303946; padding: 8px 10px; }
+            QHeaderView::section { color: #aeb8c6; background: #1d242e; border: 0; border-bottom: 1px solid #303946; padding: 4px 10px; }
             QTableWidget::item { padding: 5px 8px; }
             QSplitter::handle { background: #303946; }
             QStatusBar { color: #9ca7b8; background: #1b212a; border-top: 1px solid #303946; }
@@ -1225,7 +1225,7 @@ public:
         auto* aboutAction = helpMenu->addAction(tr("バージョン情報"));
         connect(aboutAction, &QAction::triggered, this, [this] {
             QMessageBox::about(this, tr("Lightweight File Managerについて"),
-                               tr("Lightweight File Manager\nVersion 0.4.0\n\nRust + Qt 6 Widgets"));
+                               tr("Lightweight File Manager\nVersion 0.5.0\n\nRust + Qt 6 Widgets"));
         });
 
         auto* toolbar = new QToolBar(tr("ナビゲーション"), content);
