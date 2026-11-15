@@ -384,13 +384,13 @@ public:
         m_tabs->setMovable(true);
         m_tabs->setContextMenuPolicy(Qt::CustomContextMenu);
         auto* tabRow = new QHBoxLayout;
-        tabRow->setContentsMargins(8, 4, 8, 4);
-        tabRow->setSpacing(6);
+        tabRow->setContentsMargins(6, 2, 6, 2);
+        tabRow->setSpacing(4);
         tabRow->addWidget(m_tabs, 1);
         auto* addTabButton = new QToolButton(this);
         addTabButton->setText("＋");
         addTabButton->setToolTip(tr("場所タブを追加"));
-        addTabButton->setFixedSize(30, 28);
+        addTabButton->setFixedSize(26, 24);
         tabRow->addWidget(addTabButton);
         layout->addLayout(tabRow);
 
@@ -1146,7 +1146,7 @@ public:
             QPushButton#splitButton { font-size: 14pt; font-weight: 600; padding: 5px 12px; }
             QLineEdit { color: #d9e0e9; background: #11161d; border: 1px solid #303946; border-radius: 5px; padding: 7px 9px; selection-background-color: #46658e; }
             QTabBar { background: #171c24; }
-            QTabBar::tab { color: #aeb8c6; background: #171c24; border: 0; padding: 8px 14px; min-height: 24px; }
+            QTabBar::tab { color: #aeb8c6; background: #171c24; border: 0; padding: 4px 8px; min-height: 18px; }
             QTabBar::tab:selected { color: #e6eaf0; background: #2a3442; border-radius: 5px; }
             QTableWidget { color: #d9e0e9; background: #141920; alternate-background-color: #171e27; border: 0; selection-background-color: #365273; selection-color: #ffffff; outline: 0; }
             QTableWidget::item:selected { background: #365273; color: #ffffff; }
@@ -1224,7 +1224,7 @@ public:
         auto* aboutAction = helpMenu->addAction(tr("バージョン情報"));
         connect(aboutAction, &QAction::triggered, this, [this] {
             QMessageBox::about(this, tr("Lightweight File Managerについて"),
-                               tr("Lightweight File Manager\nVersion 0.2.0\n\nRust + Qt 6 Widgets"));
+                               tr("Lightweight File Manager\nVersion 0.3.0\n\nRust + Qt 6 Widgets"));
         });
 
         auto* toolbar = new QToolBar(tr("ナビゲーション"), content);
@@ -1271,7 +1271,7 @@ public:
         workspaceLayout->setContentsMargins(0, 0, 0, 0);
         workspaceLayout->setSpacing(8);
         auto* workspaceNav = new QWidget(workspaceArea);
-        workspaceNav->setFixedWidth(260);
+        workspaceNav->setFixedWidth(220);
         workspaceNav->setStyleSheet("background: #171c24;");
         auto* workspaceNavLayout = new QVBoxLayout(workspaceNav);
         workspaceNavLayout->setContentsMargins(0, 0, 0, 0);
@@ -1283,13 +1283,13 @@ public:
         workspaceTabScroll->setWidgetResizable(true);
         workspaceTabScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         workspaceTabScroll->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
-        workspaceTabScroll->setFixedWidth(210);
+        workspaceTabScroll->setFixedWidth(190);
         m_workspaceTabsWidget = new QWidget;
         m_workspaceTabsWidget->setObjectName("workspaceTabs");
         m_workspaceTabsWidget->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
         m_workspaceTabsLayout = new QVBoxLayout(m_workspaceTabsWidget);
-        m_workspaceTabsLayout->setContentsMargins(5, 5, 5, 5);
-        m_workspaceTabsLayout->setSpacing(6);
+        m_workspaceTabsLayout->setContentsMargins(4, 4, 4, 4);
+        m_workspaceTabsLayout->setSpacing(3);
         m_workspaceTabsLayout->addStretch(1);
         workspaceTabScroll->setWidget(m_workspaceTabsWidget);
         m_pages = new QStackedWidget(workspaceArea);
@@ -1487,10 +1487,10 @@ private:
         workspace.button = new QToolButton(m_workspaceTabsWidget);
         workspace.button->setText(name);
         workspace.button->setIcon(workspaceTabIcon(icon));
-        workspace.button->setIconSize(QSize(24, 24));
+        workspace.button->setIconSize(QSize(18, 18));
         workspace.button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-        workspace.button->setMinimumWidth(180);
-        workspace.button->setFixedHeight(48);
+        workspace.button->setMinimumWidth(150);
+        workspace.button->setFixedHeight(36);
         workspace.button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
         workspace.button->setCheckable(true);
         workspace.button->setProperty("workspaceTab", true);
