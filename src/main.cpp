@@ -1,4 +1,5 @@
 #include <QApplication>
+#include <QAbstractNativeEventFilter>
 #include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
@@ -79,6 +80,7 @@
 #include <windows.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <wrl/client.h>
 #endif
 
 namespace {
@@ -148,6 +150,117 @@ QString shortcutTargetPath(const QString& shortcutPath) {
     return {};
 #endif
 }
+
+#if defined(Q_OS_WIN)
+class ShellMenuEventFilter final : public QAbstractNativeEventFilter {
+public:
+    explicit ShellMenuEventFilter(IContextMenu* contextMenu) {
+        contextMenu->QueryInterface(IID_PPV_ARGS(&m_context2));
+        contextMenu->QueryInterface(IID_PPV_ARGS(&m_context3));
+    }
+
+    bool nativeEventFilter(const QByteArray& eventType, void* message, qintptr* result) override {
+        if (eventType != "windows_generic_MSG" || (!m_context2 && !m_context3)) return false;
+        const auto* msg = static_cast<const MSG*>(message);
+        switch (msg->message) {
+        case WM_INITMENUPOPUP:
+        case WM_DRAWITEM:
+        case WM_MEASUREITEM:
+        case WM_MENUCHAR:
+            if (m_context3 && SUCCEEDED(m_context3->HandleMenuMsg2(msg->message, msg->wParam, msg->lParam,
+                                                                     reinterpret_cast<LRESULT*>(result)))) return true;
+            if (m_context2 && SUCCEEDED(m_context2->HandleMenuMsg(msg->message, msg->wParam, msg->lParam))) return true;
+            break;
+        default:
+            break;
+        }
+        return false;
+    }
+
+private:
+    Microsoft::WRL::ComPtr<IContextMenu2> m_context2;
+    Microsoft::WRL::ComPtr<IContextMenu3> m_context3;
+};
+
+bool showNativeShellContextMenu(const QStringList& paths, HWND owner, const QPoint& screenPosition, QString* failureReason) {
+    const auto fail = [failureReason](const QString& message) {
+        if (failureReason) *failureReason = message;
+        return false;
+    };
+    if (paths.isEmpty()) return false;
+    const auto comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    struct ComApartmentGuard {
+        bool active;
+        ~ComApartmentGuard() { if (active) CoUninitialize(); }
+    } apartment{SUCCEEDED(comResult)};
+    if (FAILED(comResult) && comResult != RPC_E_CHANGED_MODE)
+        return fail(QStringLiteral("CoInitializeEx: 0x%1").arg(static_cast<quint32>(comResult), 8, 16, QLatin1Char('0')));
+
+    using PidlPtr = std::unique_ptr<ITEMIDLIST, decltype(&CoTaskMemFree)>;
+    std::vector<PidlPtr> absolutePidls;
+    absolutePidls.reserve(static_cast<size_t>(paths.size()));
+    for (const auto& path : paths) {
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        SFGAOF attributes = 0;
+        const auto nativePath = QDir::toNativeSeparators(path).toStdWString();
+        const auto parseResult = SHParseDisplayName(nativePath.c_str(), nullptr, &pidl, 0, &attributes);
+        if (FAILED(parseResult))
+            return fail(QStringLiteral("SHParseDisplayName: 0x%1").arg(static_cast<quint32>(parseResult), 8, 16, QLatin1Char('0')));
+        absolutePidls.emplace_back(reinterpret_cast<ITEMIDLIST*>(pidl), CoTaskMemFree);
+    }
+
+    PidlPtr parentPidl(reinterpret_cast<ITEMIDLIST*>(ILCloneFull(reinterpret_cast<PCUIDLIST_RELATIVE>(absolutePidls.front().get()))), CoTaskMemFree);
+    if (!parentPidl || !ILRemoveLastID(parentPidl.get())) return fail(QStringLiteral("Could not create parent PIDL"));
+    std::vector<PCUITEMID_CHILD> childPidls;
+    childPidls.reserve(absolutePidls.size());
+    for (const auto& pidl : absolutePidls) {
+        PidlPtr currentParent(reinterpret_cast<ITEMIDLIST*>(ILCloneFull(reinterpret_cast<PCUIDLIST_RELATIVE>(pidl.get()))), CoTaskMemFree);
+        if (!currentParent || !ILRemoveLastID(currentParent.get()) || !ILIsEqual(parentPidl.get(), currentParent.get()))
+            return fail(QStringLiteral("Selected items do not share a Shell parent"));
+        childPidls.push_back(ILFindLastID(pidl.get()));
+    }
+
+    Microsoft::WRL::ComPtr<IShellFolder> desktopFolder;
+    Microsoft::WRL::ComPtr<IShellFolder> parentFolder;
+    auto result = SHGetDesktopFolder(desktopFolder.GetAddressOf());
+    if (FAILED(result)) return fail(QStringLiteral("SHGetDesktopFolder: 0x%1").arg(static_cast<quint32>(result), 8, 16, QLatin1Char('0')));
+    result = desktopFolder->BindToObject(parentPidl.get(), nullptr, IID_PPV_ARGS(parentFolder.GetAddressOf()));
+    if (FAILED(result)) return fail(QStringLiteral("BindToObject: 0x%1").arg(static_cast<quint32>(result), 8, 16, QLatin1Char('0')));
+    Microsoft::WRL::ComPtr<IContextMenu> contextMenu;
+    result = parentFolder->GetUIObjectOf(owner, static_cast<UINT>(childPidls.size()), childPidls.data(),
+                                         IID_IContextMenu, nullptr, reinterpret_cast<void**>(contextMenu.GetAddressOf()));
+    if (FAILED(result)) return fail(QStringLiteral("GetUIObjectOf: 0x%1").arg(static_cast<quint32>(result), 8, 16, QLatin1Char('0')));
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return fail(QStringLiteral("CreatePopupMenu failed"));
+    result = contextMenu->QueryContextMenu(menu, 0, 1, 0x7fff, CMF_NORMAL);
+    bool displayed = false;
+    if (SUCCEEDED(result) && HRESULT_CODE(result) > 0) {
+        ShellMenuEventFilter eventFilter(contextMenu.Get());
+        QCoreApplication::instance()->installNativeEventFilter(&eventFilter);
+        const auto command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                               screenPosition.x(), screenPosition.y(), owner, nullptr);
+        QCoreApplication::instance()->removeNativeEventFilter(&eventFilter);
+        displayed = true;
+        if (command != 0) {
+            CMINVOKECOMMANDINFOEX commandInfo{};
+            commandInfo.cbSize = sizeof(commandInfo);
+            commandInfo.fMask = CMIC_MASK_UNICODE;
+            commandInfo.hwnd = owner;
+            commandInfo.lpVerb = MAKEINTRESOURCEA(command - 1);
+            commandInfo.lpVerbW = MAKEINTRESOURCEW(command - 1);
+            commandInfo.nShow = SW_SHOWNORMAL;
+            contextMenu->InvokeCommand(reinterpret_cast<LPCMINVOKECOMMANDINFO>(&commandInfo));
+        }
+    } else if (FAILED(result)) {
+        if (failureReason) *failureReason = QStringLiteral("QueryContextMenu: 0x%1").arg(static_cast<quint32>(result), 8, 16, QLatin1Char('0'));
+    } else if (failureReason) {
+        *failureReason = QStringLiteral("QueryContextMenu returned no items (0x%1)").arg(static_cast<quint32>(result), 8, 16, QLatin1Char('0'));
+    }
+    DestroyMenu(menu);
+    return displayed;
+}
+#endif
 
 QString coreCreateDirectory(const QString& path) {
     const auto utf8 = path.toUtf8().toStdString();
@@ -510,7 +623,7 @@ public:
             pathBar->setText(QDir::toNativeSeparators(m_path));
         });
         connect(m_table, &QWidget::customContextMenuRequested, this, [this](const QPoint& position) {
-            showContextMenu(position);
+            showContextMenu(position, QApplication::keyboardModifiers().testFlag(Qt::ShiftModifier));
         });
         connect(m_filterBar, &QLineEdit::textChanged, this, [this] { applyFilter(); });
         addShortcut(QKeySequence::Copy, [this] { copySelection(false); });
@@ -893,7 +1006,7 @@ private:
         }
     }
 
-    void showContextMenu(const QPoint& position) {
+    void showContextMenu(const QPoint& position, bool requestShellMenu = false) {
         activate();
         const auto index = m_table->indexAt(position);
         if (index.isValid()) {
@@ -909,6 +1022,15 @@ private:
             m_table->clearSelection();
         }
         const auto paths = selectedPaths();
+#if defined(Q_OS_WIN)
+        if (requestShellMenu && !paths.isEmpty()) {
+            QString shellMenuError;
+            if (showNativeShellContextMenu(paths, reinterpret_cast<HWND>(window()->winId()),
+                                           m_table->viewport()->mapToGlobal(position), &shellMenuError)) return;
+            if (auto* mainWindow = qobject_cast<QMainWindow*>(window()))
+                mainWindow->statusBar()->showMessage(tr("Shell menu unavailable: %1").arg(shellMenuError), 8000);
+        }
+#endif
         QMenu menu(m_table);
         auto* open = menu.addAction(tr("開く"));
         open->setEnabled(paths.size() == 1);
@@ -1225,7 +1347,7 @@ public:
         auto* aboutAction = helpMenu->addAction(tr("バージョン情報"));
         connect(aboutAction, &QAction::triggered, this, [this] {
             QMessageBox::about(this, tr("Lightweight File Managerについて"),
-                               tr("Lightweight File Manager\nVersion 0.5.0\n\nRust + Qt 6 Widgets"));
+                               tr("Lightweight File Manager\nVersion 0.7.0\n\nRust + Qt 6 Widgets"));
         });
 
         auto* toolbar = new QToolBar(tr("ナビゲーション"), content);
@@ -1650,7 +1772,7 @@ private:
         const auto countLabel = tr("%1 ファイル").arg(pane ? pane->fileCount() : 0);
         statusBar()->showMessage(paneLabel + (workspace.visiblePaneCount > 1 ? QStringLiteral("（") + direction + QStringLiteral("）") : QString{})
                                  + QStringLiteral("　|　") + countLabel
-                                 + tr("　|　フォルダーをダブルクリック　ファイルを右クリックで操作"));
+                                 + tr("　|　フォルダーをダブルクリック　右クリック: アプリメニュー / Shift+右クリック: Windows Shell"));
     }
 
     void updateSplitButton(int paneCount) {
