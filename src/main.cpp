@@ -1140,10 +1140,11 @@ public:
             QMenuBar { color: #cbd2dd; background: #171c24; }
             QMenuBar::item { padding: 6px 10px; background: transparent; }
             QMenuBar::item:selected { background: #2a3442; }
-            QToolBar { background: #1b212a; border: 0; spacing: 8px; padding: 6px 10px; }
+            QToolBar { background: #1b212a; border: 0; spacing: 4px; padding: 4px 8px; }
+            QToolBar QToolButton { padding: 3px 6px; }
             QToolButton, QPushButton { color: #cbd2dd; background: #252d38; border: 1px solid #303946; border-radius: 5px; padding: 6px 10px; }
             QToolButton:hover, QPushButton:hover { background: #303b49; }
-            QPushButton#splitButton { font-size: 14pt; font-weight: 600; padding: 5px 12px; }
+            QPushButton#splitButton { font-size: 12pt; font-weight: 600; padding: 3px 8px; }
             QLineEdit { color: #d9e0e9; background: #11161d; border: 1px solid #303946; border-radius: 5px; padding: 7px 9px; selection-background-color: #46658e; }
             QTabBar { background: #171c24; }
             QTabBar::tab { color: #aeb8c6; background: #171c24; border: 0; padding: 4px 8px; min-height: 18px; }
@@ -1224,12 +1225,12 @@ public:
         auto* aboutAction = helpMenu->addAction(tr("バージョン情報"));
         connect(aboutAction, &QAction::triggered, this, [this] {
             QMessageBox::about(this, tr("Lightweight File Managerについて"),
-                               tr("Lightweight File Manager\nVersion 0.3.0\n\nRust + Qt 6 Widgets"));
+                               tr("Lightweight File Manager\nVersion 0.4.0\n\nRust + Qt 6 Widgets"));
         });
 
         auto* toolbar = new QToolBar(tr("ナビゲーション"), content);
         toolbar->setMovable(false);
-        toolbar->setIconSize(QSize(28, 28));
+        toolbar->setIconSize(QSize(22, 22));
         m_backAction = toolbar->addAction(toolbarIcon(QStringLiteral("back")), tr("戻る"));
         m_forwardAction = toolbar->addAction(toolbarIcon(QStringLiteral("forward")), tr("進む"));
         auto* upAction = toolbar->addAction(toolbarIcon(QStringLiteral("up")), tr("上へ"));
@@ -1254,8 +1255,8 @@ public:
         m_splitButton = new QPushButton(tr("分割 1"), toolbar);
         m_splitButton->setObjectName("splitButton");
         m_splitButton->setIcon(splitIndicatorIcon(1));
-        m_splitButton->setIconSize(QSize(28, 24));
-        m_splitButton->setMinimumHeight(42);
+        m_splitButton->setIconSize(QSize(22, 20));
+        m_splitButton->setMinimumHeight(34);
         auto* splitMenu = new QMenu(m_splitButton);
         auto* horizontalSplit = splitMenu->addAction(tr("左右に分割"));
         auto* verticalSplit = splitMenu->addAction(tr("上下に分割"));
@@ -1297,8 +1298,8 @@ public:
         auto* addButton = new QToolButton(workspaceNav);
         addButton->setText("＋");
         addButton->setToolTip(tr("メインタブを追加"));
-        addButton->setFixedHeight(48);
-        addButton->setStyleSheet("QToolButton { color: #d8e5f8; background: #252d38; border: 1px solid #303946; border-radius: 6px; font-size: 18pt; }");
+        addButton->setFixedHeight(38);
+        addButton->setStyleSheet("QToolButton { color: #d8e5f8; background: #252d38; border: 1px solid #303946; border-radius: 6px; font-size: 14pt; }");
         workspaceNavLayout->addWidget(addButton);
         workspaceLayout->addWidget(workspaceNav);
         workspaceLayout->addWidget(m_pages, 1);
