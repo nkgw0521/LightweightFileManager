@@ -709,19 +709,26 @@ public:
     void createNewFolder() { createFolder(); }
     bool openTerminalAt(const QString& path) const {
 #if defined(Q_OS_WIN)
-        const auto systemRoot = qEnvironmentVariable("SystemRoot", QStringLiteral("C:/Windows"));
-        auto command = QDir(systemRoot).filePath(QStringLiteral("System32/cmd.exe"));
-        if (!QFileInfo::exists(command)) command = QStandardPaths::findExecutable(QStringLiteral("cmd.exe"));
-        if (command.isEmpty()) return false;
-        const auto nativeCommand = QDir::toNativeSeparators(command);
-        auto commandLine = QStringLiteral("\"") + nativeCommand + QStringLiteral("\"");
+        // Launch Windows Terminal itself so its configured default profile is
+        // used (for example, PowerShell) instead of hard-coding cmd.exe.
+        const auto terminal = QStandardPaths::findExecutable(QStringLiteral("wt.exe"));
+        if (!terminal.isEmpty())
+            return QProcess::startDetached(terminal, {QStringLiteral("-d"), path}, path);
+
+        // Windows Terminal may be unavailable; fall back to the installed
+        // PowerShell executable rather than unexpectedly opening Command Prompt.
+        auto shell = QStandardPaths::findExecutable(QStringLiteral("pwsh.exe"));
+        if (shell.isEmpty()) shell = QStandardPaths::findExecutable(QStringLiteral("powershell.exe"));
+        if (shell.isEmpty()) return false;
+        const auto nativeShell = QDir::toNativeSeparators(shell);
+        auto commandLine = QStringLiteral("\"") + nativeShell + QStringLiteral("\"");
         auto mutableCommandLine = commandLine.toStdWString();
         const auto workingDirectory = QDir::toNativeSeparators(path).toStdWString();
         STARTUPINFOW startupInfo{};
         startupInfo.cb = sizeof(startupInfo);
         PROCESS_INFORMATION processInfo{};
         const auto started = CreateProcessW(
-            reinterpret_cast<LPCWSTR>(nativeCommand.utf16()), mutableCommandLine.data(),
+            reinterpret_cast<LPCWSTR>(nativeShell.utf16()), mutableCommandLine.data(),
             nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr, workingDirectory.c_str(),
             &startupInfo, &processInfo);
         if (!started) return false;
