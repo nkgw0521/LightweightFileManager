@@ -1090,6 +1090,20 @@ private:
         if (paths.size() != 1) return;
         const auto path = paths.first();
         if (QFileInfo(path).isDir()) setPath(path);
+#if defined(Q_OS_WIN)
+        else if (QFileInfo(path).suffix().compare(QStringLiteral("bat"), Qt::CaseInsensitive) == 0 ||
+                 QFileInfo(path).suffix().compare(QStringLiteral("cmd"), Qt::CaseInsensitive) == 0) {
+            // ShellExecute inherits the file manager's working directory for
+            // batch files. Start cmd explicitly with the containing folder as
+            // its working directory so relative paths inside the script work.
+            const auto scriptDirectory = QFileInfo(path).absolutePath();
+            if (!QProcess::startDetached(QStringLiteral("cmd.exe"),
+                                         {QStringLiteral("/c"), QDir::toNativeSeparators(path)},
+                                         scriptDirectory))
+                QMessageBox::warning(this, tr("バッチファイルを実行できません"),
+                                     tr("このバッチファイルを実行できませんでした。"));
+        }
+#endif
         else if (QFileInfo(path).suffix().compare(QStringLiteral("lnk"), Qt::CaseInsensitive) == 0) {
             const auto target = shortcutTargetPath(path);
             if (QFileInfo(target).isDir()) setPath(target);
