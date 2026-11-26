@@ -454,6 +454,9 @@ protected:
         for (const auto& path : paths) urls.append(QUrl::fromLocalFile(path));
         mimeData->setUrls(urls);
 #if defined(Q_OS_WIN)
+        // Some Windows applications inspect plain text instead of CF_HDROP.
+        // Supply native paths there as well as the URL list used by Qt/Explorer.
+        mimeData->setText(paths.join(QStringLiteral("\r\n")));
         QByteArray effect(sizeof(quint32), Qt::Uninitialized);
         qToLittleEndian<quint32>(1, reinterpret_cast<uchar*>(effect.data()));
         mimeData->setData(QStringLiteral("Preferred DropEffect"), effect);
@@ -593,10 +596,14 @@ public:
             if (menu.exec(m_tabs->mapToGlobal(position)) != toggleLock) return;
             if (isTabLocked(index)) m_lockedTabs.remove(index);
             else m_lockedTabs.insert(index);
+            normalizeLockedTabs();
             updateTabLabel(index);
             notifyChanged();
         });
-        connect(m_tabs, &QTabBar::tabMoved, this, [this](int from, int to) { moveLockedTabIndex(from, to); });
+        connect(m_tabs, &QTabBar::tabMoved, this, [this](int from, int to) {
+            moveLockedTabIndex(from, to);
+            normalizeLockedTabs();
+        });
         connect(m_tabs, &QTabBar::currentChanged, this, [this](int index) {
             const auto destination = m_tabs->tabData(index).toString();
             if (!destination.isEmpty()) {
@@ -628,6 +635,7 @@ public:
         connect(m_filterBar, &QLineEdit::textChanged, this, [this] { applyFilter(); });
         addShortcut(QKeySequence::Copy, [this] { copySelection(false); });
         addShortcut(QKeySequence::Cut, [this] { copySelection(true); });
+        addShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+C")), [this] { copySelectedPaths(); });
         addShortcut(QKeySequence::Paste, [this] { pasteClipboard(); });
         addShortcut(QKeySequence::Delete, [this] { deleteSelection(); });
         addShortcut(QKeySequence(Qt::Key_F2), [this] { renameSelection(); });
@@ -798,6 +806,25 @@ private:
         m_lockedTabs = adjusted;
     }
 
+    void normalizeLockedTabs() {
+        QVector<bool> locked;
+        locked.reserve(m_tabs->count());
+        for (int i = 0; i < m_tabs->count(); ++i) locked.append(m_lockedTabs.contains(i));
+        const QSignalBlocker blocker(m_tabs);
+        int target = 0;
+        for (int i = 0; i < locked.size(); ++i) {
+            if (!locked[i]) continue;
+            if (i != target) {
+                m_tabs->moveTab(i, target);
+                locked.move(i, target);
+            }
+            ++target;
+        }
+        m_lockedTabs.clear();
+        for (int i = 0; i < locked.size(); ++i) if (locked[i]) m_lockedTabs.insert(i);
+        for (int i = 0; i < m_tabs->count(); ++i) updateTabLabel(i);
+    }
+
     void updateTabLabel(int index) {
         const auto path = m_tabs->tabData(index).toString();
         m_tabs->setTabText(index, (isTabLocked(index) ? QStringLiteral("🔒 ") : QString{}) + folderLabel(path));
@@ -810,6 +837,12 @@ private:
 
     void addLocationTab(const QString& path) {
         const auto clean = QDir::cleanPath(path);
+        for (int i = 0; i < m_tabs->count(); ++i) {
+            if (m_tabs->tabData(i).toString() == clean) {
+                m_tabs->setCurrentIndex(i);
+                return;
+            }
+        }
         const auto index = m_tabs->addTab(folderLabel(clean));
         m_tabs->setTabData(index, clean);
         m_tabs->setCurrentIndex(index);
@@ -1070,7 +1103,7 @@ private:
         auto* chosen = menu.exec(m_table->viewport()->mapToGlobal(position));
         if (chosen == open) openSelection();
         else if (chosen == openInNewTab && paths.size() == 1) { addLocationTab(paths.first()); notifyChanged(); }
-        else if (chosen == copyPath && paths.size() == 1) QApplication::clipboard()->setText(QDir::toNativeSeparators(paths.first()));
+        else if (chosen == copyPath && paths.size() == 1) copySelectedPaths();
         else if (chosen == terminal && !openTerminalAt(terminalDirectory)) {
             QMessageBox::warning(this, tr("端末を開けません"), tr("この環境でターミナルを起動できませんでした。"));
         }
@@ -1127,6 +1160,15 @@ private:
         }
 #endif
         QApplication::clipboard()->setMimeData(mimeData);
+    }
+
+    void copySelectedPaths() {
+        const auto paths = selectedPaths();
+        if (paths.isEmpty()) return;
+        QStringList nativePaths;
+        nativePaths.reserve(paths.size());
+        for (const auto& path : paths) nativePaths.append(QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath()));
+        QApplication::clipboard()->setText(nativePaths.join(QStringLiteral("\r\n")));
     }
 
     void pasteClipboard() {

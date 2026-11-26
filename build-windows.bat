@@ -1,6 +1,9 @@
 @echo off
 setlocal
 
+rem Run all relative commands from the directory containing this script.
+cd /d "%~dp0"
+
 set "VSDEVCMD=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"
 if exist "%VSDEVCMD%" goto have_vsdev
 
