@@ -58,10 +58,12 @@
 #include <QEvent>
 #include <QDrag>
 #include <QMouseEvent>
+#include <QKeyEvent>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QDragMoveEvent>
 #include <QRegularExpression>
+#include <QContextMenuEvent>
 #include <QSvgRenderer>
 #include <QScrollArea>
 #include <QFutureWatcher>
@@ -443,8 +445,18 @@ public:
     using QTableWidget::QTableWidget;
     std::function<QStringList()> selectedFilePaths;
     std::function<void(const QList<QUrl>&, const QPoint&)> filesDropped;
+    std::function<void()> openSelected;
 
 protected:
+    void keyPressEvent(QKeyEvent* event) override {
+        if ((event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) && openSelected) {
+            openSelected();
+            event->accept();
+            return;
+        }
+        QTableWidget::keyPressEvent(event);
+    }
+
     void startDrag(Qt::DropActions) override {
         if (!selectedFilePaths) return;
         const auto paths = selectedFilePaths();
@@ -570,6 +582,7 @@ public:
         m_filterBar->installEventFilter(this);
         m_table->selectedFilePaths = [this] { return selectedPaths(); };
         m_table->filesDropped = [this](const QList<QUrl>& urls, const QPoint& point) { dropUrls(urls, point); };
+        m_table->openSelected = [this] { openSelection(); };
 
         connect(pathBar, &QLineEdit::returnPressed, this, [this, pathBar] {
             activate();
@@ -630,7 +643,9 @@ public:
             pathBar->setText(QDir::toNativeSeparators(m_path));
         });
         connect(m_table, &QWidget::customContextMenuRequested, this, [this](const QPoint& position) {
-            showContextMenu(position, QApplication::keyboardModifiers().testFlag(Qt::ShiftModifier));
+            const auto requestShellMenu = m_shiftContextMenuEvent;
+            m_shiftContextMenuEvent = false;
+            showContextMenu(position, requestShellMenu);
         });
         connect(m_filterBar, &QLineEdit::textChanged, this, [this] { applyFilter(); });
         addShortcut(QKeySequence::Copy, [this] { copySelection(false); });
@@ -640,8 +655,6 @@ public:
         addShortcut(QKeySequence::Delete, [this] { deleteSelection(); });
         addShortcut(QKeySequence(Qt::Key_F2), [this] { renameSelection(); });
         addShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+N")), [this] { createFolder(); });
-        addShortcut(QKeySequence(Qt::Key_Return), [this] { openSelection(); });
-        addShortcut(QKeySequence(Qt::Key_Enter), [this] { openSelection(); });
         addShortcut(QKeySequence(Qt::Key_Backspace), [this] { goUp(); });
         addShortcut(QKeySequence(Qt::Key_Home), [this] { selectBoundaryRow(false); });
         addShortcut(QKeySequence(Qt::Key_End), [this] { selectBoundaryRow(true); });
@@ -758,6 +771,10 @@ public:
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override {
+        if ((watched == m_table || watched == m_table->viewport()) && event->type() == QEvent::ContextMenu) {
+            const auto* contextEvent = static_cast<QContextMenuEvent*>(event);
+            m_shiftContextMenuEvent = contextEvent->modifiers().testFlag(Qt::ShiftModifier);
+        }
         Q_UNUSED(watched);
         if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::FocusIn) activate();
         return QWidget::eventFilter(watched, event);
@@ -780,6 +797,7 @@ private:
     int m_sortColumn = 0;
     Qt::SortOrder m_sortOrder = Qt::AscendingOrder;
     bool m_replayingHistory = false;
+    bool m_shiftContextMenuEvent = false;
     QSet<int> m_lockedTabs;
 
     bool isTabLocked(int index) const {
