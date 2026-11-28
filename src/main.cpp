@@ -643,7 +643,9 @@ public:
             pathBar->setText(QDir::toNativeSeparators(m_path));
         });
         connect(m_table, &QWidget::customContextMenuRequested, this, [this](const QPoint& position) {
-            const auto requestShellMenu = m_shiftContextMenuEvent;
+            // Event modifiers can be missing/stale in some states, so also query the live key state.
+            const auto requestShellMenu = m_shiftContextMenuEvent
+                || QGuiApplication::queryKeyboardModifiers().testFlag(Qt::ShiftModifier);
             m_shiftContextMenuEvent = false;
             showContextMenu(position, requestShellMenu);
         });
@@ -1081,6 +1083,10 @@ private:
         }
         const auto paths = selectedPaths();
 #if defined(Q_OS_WIN)
+        if (requestShellMenu && paths.isEmpty()) {
+            if (auto* mainWindow = qobject_cast<QMainWindow*>(window()))
+                mainWindow->statusBar()->showMessage(tr("Shell menu: no item selected under the cursor"), 8000);
+        }
         if (requestShellMenu && !paths.isEmpty()) {
             QString shellMenuError;
             if (showNativeShellContextMenu(paths, reinterpret_cast<HWND>(window()->winId()),
