@@ -524,7 +524,6 @@ public:
 
         auto* pathBar = new QLineEdit(this);
         m_pathBar = pathBar;
-        pathBar->installEventFilter(this);
         pathBar->setText(QDir::toNativeSeparators(m_path));
         pathBar->setClearButtonEnabled(true);
         pathBar->setPlaceholderText(tr("フォルダーのパス"));
@@ -559,6 +558,7 @@ public:
         m_table->setDefaultDropAction(Qt::CopyAction);
         m_table->installEventFilter(this);
         m_table->viewport()->installEventFilter(this);
+        pathBar->installEventFilter(this);
         m_table->verticalHeader()->hide();
         m_table->setSortingEnabled(false);
         m_table->horizontalHeader()->setSectionsClickable(true);
@@ -771,7 +771,7 @@ public:
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override {
-        if ((watched == m_table || watched == m_table->viewport()) && event->type() == QEvent::ContextMenu) {
+        if (m_table && (watched == m_table || watched == m_table->viewport()) && event->type() == QEvent::ContextMenu) {
             const auto* contextEvent = static_cast<QContextMenuEvent*>(event);
             m_shiftContextMenuEvent = contextEvent->modifiers().testFlag(Qt::ShiftModifier);
         }
